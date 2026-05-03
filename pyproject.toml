@@ -5,23 +5,24 @@ description = "Autonomous pretraining research swarm"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "kernels>=0.11.7",
+    "accelerate>=0.34.0",
+    "datasets>=2.20.0",
     "matplotlib>=3.10.8",
-    "numpy>=2.2.6",
+    "numpy>=1.26.0",
     "pandas>=2.3.3",
+    "peft>=0.12.0",
     "pyarrow>=21.0.0",
     "requests>=2.32.0",
-    "rustbpe>=0.1.0",
-    "tiktoken>=0.11.0",
-    "torch==2.9.1",
+    "torch==2.4.1",
+    "transformers>=4.44.0",
 ]
 
 [tool.uv.sources]
 torch = [
-    { index = "pytorch-cu128" },
+    { index = "pytorch-cu121" },
 ]
 
 [[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
 explicit = true
