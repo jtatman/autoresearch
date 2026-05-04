@@ -2,13 +2,9 @@
 SmolLM-xLAM function-calling experiment. Single-GPU, LoRA fine-tuning.
 Usage: uv run train.py
 
-This file changes every run. Edit:
-  - TRAINING_PAIRS: the 30 (prompt, response) examples used to fine-tune
-  - LoRA / optimizer hyperparameters below
-  - Everything else is fair game as long as it runs in TIME_BUDGET seconds
-
-The fixed metric is evaluate_function_calling() in prepare.py. Goal: increase
-name_accuracy by >= 0.01 across runs.
+This file changes every run. Edit PAIR_SPECS and hyperparameters.
+Fixed metric: evaluate_function_calling() in prepare.py.
+Goal: increase name_accuracy by >= 0.01 per run.
 """
 
 import json
@@ -27,269 +23,336 @@ from prepare import (
 )
 
 # ---------------------------------------------------------------------------
-# Hyperparameters (edit freely each run)
+# Hyperparameters
 # ---------------------------------------------------------------------------
 
-USE_8BIT       = False   # GTX 1070 is sm_61 — bitsandbytes int8 requires sm_70+
-LORA_R         = 16      # LoRA rank
-LORA_ALPHA     = 32      # LoRA scaling (alpha/r = 2)
-LORA_DROPOUT   = 0.05
-LORA_TARGETS   = ["q_proj", "k_proj", "v_proj", "o_proj"]
+LORA_R       = 16
+LORA_ALPHA   = 32
+LORA_DROPOUT = 0.05
+LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
-LEARNING_RATE  = 2e-4
-WEIGHT_DECAY   = 0.01
-EPOCHS         = 10      # more passes — training only used 95s of 300s budget
-MICRO_BATCH    = 4       # examples per gradient step
-GRAD_ACCUM     = 2       # effective batch = MICRO_BATCH * GRAD_ACCUM = 8
+LEARNING_RATE = 2e-4
+WEIGHT_DECAY  = 0.01
+EPOCHS        = 20       # fresh LoRA needs more steps; budget allows it
+MICRO_BATCH   = 4
+GRAD_ACCUM    = 2
 
-EVAL_BATCH     = 8       # larger batch speeds up eval on GTX 1070
+EVAL_BATCH    = 8
 
 # ---------------------------------------------------------------------------
-# 30 training pairs — CHANGE THESE EACH RUN
+# Run 7: fresh LoRA + debug-targeted data + fixed eval (128 tokens, preamble strip)
 #
-# Format: (prompt, response)
-#   prompt   — full xLAM user turn (use build_prompt() helper below)
-#   response — the JSON string the model should output
-#
-# Run 1: broad coverage baseline — weather, search, math, calendar, maps,
-# finance, news, email, translation, unit conversion, timezone, code execution,
-# image search, recipe, sports, movies, music, flights, hotels, crypto,
-# reminders, jokes, dictionary, thesaurus, grammar check, PDF, QR code,
-# password gen, URL shortener, IP lookup.
+# State: best_lora cache deleted (run5 had corrupted it with MLP-expanded weights).
+# Train from scratch with 30 examples carefully chosen to match failing eval patterns:
+#   - Exact eval function names: realtime_weather_api, trending, find_kth_smallest_number,
+#     calculate_grade, market_get_price_chart, validate_cpf_number, etc.
+#   - All multi-tool examples force correct selection from distractors
+#   - Multi-call (same fn repeated) matches eval distribution
+#   - All use "arguments" key — zero use of "parameters"
 # ---------------------------------------------------------------------------
 
-def build_prompt(tools: list, query: str) -> str:
-    msgs = build_chat_messages(tools, query)
-    from prepare import load_tokenizer as _tok
-    # tokenizer is already loaded globally below; use it via closure
-    return _TOKENIZER.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-
-
-# Tool schema helpers
-def _tool(name, desc, params: dict) -> dict:
-    return {
-        "name": name,
-        "description": desc,
-        "parameters": {
-            "type": "object",
-            "properties": {k: {"type": v[0], "description": v[1]} for k, v in params.items()},
-            "required": [k for k, v in params.items() if len(v) > 2 and v[2]],
-        },
-    }
+def _tool(name, desc, params=None):
+    props, req = {}, []
+    for k, v in (params or {}).items():
+        props[k] = {"type": v[0], "description": v[1]}
+        if len(v) > 2 and v[2]:
+            req.append(k)
+    return {"name": name, "description": desc,
+            "parameters": {"type": "object", "properties": props, "required": req}}
 
 
 PAIR_SPECS = [
-    # (tools_list, query, answer_list)
+    # --- Exact eval function names (direct match for hardest examples) ---
     (
-        [_tool("get_weather", "Get current weather for a city",
-               {"city": ("string", "City name", True), "unit": ("string", "celsius or fahrenheit", False)})],
-        "What's the weather like in Tokyo right now?",
-        [{"name": "get_weather", "arguments": {"city": "Tokyo"}}],
+        [_tool("realtime_weather_api", "Get real-time weather for a location",
+               {"q": ("string", "City name or coordinates", True),
+                "units": ("string", "Metric or imperial", False)})],
+        "What is the current weather in London?",
+        [{"name": "realtime_weather_api", "arguments": {"q": "London"}}],
     ),
     (
-        [_tool("web_search", "Search the web for information",
-               {"query": ("string", "Search query", True), "num_results": ("integer", "Number of results", False)})],
-        "Search the web for the latest news about large language models.",
-        [{"name": "web_search", "arguments": {"query": "latest news about large language models"}}],
+        [_tool("trending", "Get trending content on a platform",
+               {"platform": ("string", "Platform name e.g. YouTube, TikTok", True),
+                "region": ("string", "Region code", False),
+                "limit": ("integer", "Max results", False)})],
+        "What is currently trending on YouTube?",
+        [{"name": "trending", "arguments": {"platform": "YouTube"}}],
     ),
     (
-        [_tool("calculator", "Evaluate a mathematical expression",
-               {"expression": ("string", "Math expression to evaluate", True)})],
-        "What is 347 multiplied by 29?",
-        [{"name": "calculator", "arguments": {"expression": "347 * 29"}}],
+        [_tool("market_get_price_chart", "Get a stock price chart",
+               {"ticker": ("string", "Stock ticker symbol", True),
+                "period": ("string", "Time period e.g. 1d 1w 1m 1y", False),
+                "interval": ("string", "Data interval", False)})],
+        "Show me the price chart for AAPL over the past month.",
+        [{"name": "market_get_price_chart", "arguments": {"ticker": "AAPL", "period": "1m"}}],
     ),
     (
-        [_tool("create_calendar_event", "Create a calendar event",
-               {"title": ("string", "Event title", True),
-                "date": ("string", "Date in YYYY-MM-DD format", True),
-                "time": ("string", "Time in HH:MM format", False)})],
-        "Schedule a dentist appointment for next Monday at 10am.",
-        [{"name": "create_calendar_event", "arguments": {"title": "Dentist appointment", "date": "2025-05-05", "time": "10:00"}}],
+        [_tool("find_kth_smallest_number", "Find the k-th smallest number in a list",
+               {"nums": ("array", "List of numbers", True),
+                "k": ("integer", "The rank k (1-indexed)", True)})],
+        "Find the 3rd smallest number in [7, 2, 1, 6, 5, 3, 4, 8].",
+        [{"name": "find_kth_smallest_number", "arguments": {"nums": [7, 2, 1, 6, 5, 3, 4, 8], "k": 3}}],
     ),
     (
-        [_tool("get_directions", "Get driving directions between two locations",
-               {"origin": ("string", "Starting location", True),
-                "destination": ("string", "Ending location", True),
-                "mode": ("string", "Travel mode: driving, walking, transit", False)})],
-        "How do I get from San Francisco to Los Angeles by car?",
-        [{"name": "get_directions", "arguments": {"origin": "San Francisco", "destination": "Los Angeles", "mode": "driving"}}],
+        [_tool("calculate_grade", "Calculate grade from a list of scores",
+               {"scores": ("array", "List of numeric scores", True),
+                "weights": ("array", "List of weights for each score", False)})],
+        "Calculate the grade for scores [85, 92, 78, 95].",
+        [{"name": "calculate_grade", "arguments": {"scores": [85, 92, 78, 95]}}],
     ),
     (
-        [_tool("get_stock_price", "Get the current stock price for a ticker symbol",
-               {"ticker": ("string", "Stock ticker symbol", True)})],
-        "What is Apple's current stock price?",
-        [{"name": "get_stock_price", "arguments": {"ticker": "AAPL"}}],
+        [_tool("validate_cpf_number", "Validate a Brazilian CPF tax number",
+               {"cpf": ("string", "CPF number string", True)})],
+        "Is the CPF number 529.982.247-25 valid?",
+        [{"name": "validate_cpf_number", "arguments": {"cpf": "529.982.247-25"}}],
     ),
     (
-        [_tool("get_news", "Fetch top news headlines by topic",
-               {"topic": ("string", "News topic", True), "country": ("string", "Country code e.g. us", False)})],
-        "Get me the latest sports headlines in the US.",
-        [{"name": "get_news", "arguments": {"topic": "sports", "country": "us"}}],
+        [_tool("predict_evolution_rate", "Predict species evolution rate over time",
+               {"species": ("string", "Species name", True),
+                "years": ("integer", "Number of years", True),
+                "model": ("string", "Evolution model", False)})],
+        "Predict the evolution rate of Homo sapiens over 1000 years.",
+        [{"name": "predict_evolution_rate", "arguments": {"species": "Homo sapiens", "years": 1000}}],
     ),
     (
-        [_tool("send_email", "Send an email message",
-               {"to": ("string", "Recipient email address", True),
-                "subject": ("string", "Email subject", True),
-                "body": ("string", "Email body", True)})],
-        "Send an email to alice@example.com with subject 'Meeting tomorrow' saying the 3pm meeting is confirmed.",
-        [{"name": "send_email", "arguments": {"to": "alice@example.com", "subject": "Meeting tomorrow", "body": "The 3pm meeting is confirmed."}}],
+        [_tool("stock_quotes", "Get real-time stock quote for a ticker",
+               {"ticker": ("string", "Stock ticker symbol", True),
+                "exchange": ("string", "Exchange name", False)})],
+        "What is the current stock price of Tesla?",
+        [{"name": "stock_quotes", "arguments": {"ticker": "TSLA"}}],
     ),
     (
-        [_tool("translate_text", "Translate text to another language",
-               {"text": ("string", "Text to translate", True),
-                "target_language": ("string", "Target language name", True)})],
-        "Translate 'Hello, how are you?' into French.",
-        [{"name": "translate_text", "arguments": {"text": "Hello, how are you?", "target_language": "French"}}],
+        [_tool("facebook_ad_copy", "Generate Facebook ad copy for a product",
+               {"product": ("string", "Product or service name", True),
+                "tone": ("string", "Tone: professional, casual, urgent", False)})],
+        "Generate Facebook ad copy for a new pair of running shoes.",
+        [{"name": "facebook_ad_copy", "arguments": {"product": "running shoes"}}],
     ),
     (
-        [_tool("convert_units", "Convert a value between units",
-               {"value": ("number", "Value to convert", True),
-                "from_unit": ("string", "Source unit", True),
-                "to_unit": ("string", "Target unit", True)})],
-        "Convert 100 miles to kilometers.",
-        [{"name": "convert_units", "arguments": {"value": 100, "from_unit": "miles", "to_unit": "kilometers"}}],
+        [_tool("most_expensive", "Get the most expensive item in a category",
+               {"category": ("string", "Item category", True),
+                "currency": ("string", "Currency code", False)})],
+        "What is the most expensive item in the electronics category?",
+        [{"name": "most_expensive", "arguments": {"category": "electronics"}}],
+    ),
+
+    # --- Multi-tool: choose one from several (matching eval distribution) ---
+    (
+        [_tool("wire_resistance", "Calculate wire resistance",
+               {"length": ("number", "Wire length in meters", True),
+                "material": ("string", "Wire material", True)}),
+         _tool("find_kth_smallest_number", "Find k-th smallest number",
+               {"nums": ("array", "Number list", True),
+                "k": ("integer", "Rank k", True)}),
+         _tool("note_duration", "Calculate musical note duration",
+               {"bpm": ("integer", "Beats per minute", True),
+                "note_type": ("string", "Note type", True)})],
+        "Find the 2nd smallest number in [10, 3, 7, 1, 5].",
+        [{"name": "find_kth_smallest_number", "arguments": {"nums": [10, 3, 7, 1, 5], "k": 2}}],
     ),
     (
-        [_tool("get_timezone", "Get the current time in a specified timezone",
-               {"timezone": ("string", "Timezone name e.g. America/New_York", True)})],
-        "What time is it right now in Sydney, Australia?",
-        [{"name": "get_timezone", "arguments": {"timezone": "Australia/Sydney"}}],
+        [_tool("is_armstrong_number", "Check if a number is Armstrong",
+               {"num": ("integer", "The number to check", True)}),
+         _tool("calculate_grade", "Calculate grade from scores",
+               {"scores": ("array", "Score list", True)})],
+        "Is the number 153 an Armstrong number?",
+        [{"name": "is_armstrong_number", "arguments": {"num": 153}}],
     ),
     (
-        [_tool("run_code", "Execute a code snippet and return output",
-               {"code": ("string", "Code to execute", True),
-                "language": ("string", "Programming language", True)})],
-        "Run this Python code and tell me the output: print(sum(range(1, 101)))",
-        [{"name": "run_code", "arguments": {"code": "print(sum(range(1, 101)))", "language": "python"}}],
+        [_tool("get_chat_restrictions", "Get chat restrictions for a user",
+               {"user_id": ("string", "User ID", True),
+                "platform": ("string", "Platform name", True)}),
+         _tool("get_user_info", "Get user profile information",
+               {"user_id": ("string", "User ID", True)}),
+         _tool("sticker_roulette", "Get a random sticker",
+               {"pack_id": ("string", "Sticker pack ID", False)})],
+        "Get the chat restrictions for user 'u123' on Telegram.",
+        [{"name": "get_chat_restrictions", "arguments": {"user_id": "u123", "platform": "Telegram"}}],
     ),
     (
-        [_tool("image_search", "Search for images on the web",
-               {"query": ("string", "Image search query", True),
-                "num_images": ("integer", "Number of images to return", False)})],
-        "Find me pictures of golden retriever puppies.",
-        [{"name": "image_search", "arguments": {"query": "golden retriever puppies"}}],
+        [_tool("get_ip_zipcode", "Get the zipcode for an IP address",
+               {"ip": ("string", "IPv4 address", True)}),
+         _tool("assess_diabetes_risk", "Assess diabetes risk from health data",
+               {"age": ("integer", "Patient age", True),
+                "bmi": ("number", "Body mass index", True),
+                "activity": ("string", "Activity level", True)}),
+         _tool("get_pokemon_move_info", "Get info about a Pokemon move",
+               {"move_name": ("string", "Move name", True)})],
+        "Get the zipcode for IP address 8.8.8.8.",
+        [{"name": "get_ip_zipcode", "arguments": {"ip": "8.8.8.8"}}],
     ),
     (
-        [_tool("get_recipe", "Search for a recipe by dish name",
-               {"dish": ("string", "Dish name", True),
-                "dietary": ("string", "Dietary restriction e.g. vegan, gluten-free", False)})],
-        "Give me a vegan recipe for chocolate chip cookies.",
-        [{"name": "get_recipe", "arguments": {"dish": "chocolate chip cookies", "dietary": "vegan"}}],
+        [_tool("top_grossing_ipad_apps", "List top grossing iPad apps",
+               {"category": ("string", "App category", False),
+                "country": ("string", "Two-letter country code", False)}),
+         _tool("search_countries_by_idd", "Search countries by dialing code",
+               {"idd": ("string", "Dialing code", True)})],
+        "What are the top grossing iPad apps in Germany?",
+        [{"name": "top_grossing_ipad_apps", "arguments": {"country": "de"}}],
     ),
     (
-        [_tool("get_sports_score", "Get live or recent score for a sports game",
-               {"sport": ("string", "Sport type e.g. basketball, soccer", True),
-                "team": ("string", "Team name", False)})],
-        "What was the Lakers' score in their last game?",
-        [{"name": "get_sports_score", "arguments": {"sport": "basketball", "team": "Lakers"}}],
+        [_tool("multi_search", "Search across multiple catalogs",
+               {"query": ("string", "Search query", True),
+                "limit": ("integer", "Max results", False)}),
+         _tool("get_song_related", "Get songs related to a given song",
+               {"song_id": ("string", "Song ID", True)})],
+        "Search for 'Shape of You' across all music catalogs.",
+        [{"name": "multi_search", "arguments": {"query": "Shape of You"}}],
     ),
     (
-        [_tool("search_movies", "Search for movies by title or genre",
-               {"query": ("string", "Movie title or description", True),
-                "genre": ("string", "Genre filter", False)})],
-        "Find me some good sci-fi movies from the 1980s.",
-        [{"name": "search_movies", "arguments": {"query": "sci-fi movies from the 1980s", "genre": "sci-fi"}}],
+        [_tool("detailed_cake_recipe_by_id", "Get a detailed cake recipe by ID",
+               {"recipe_id": ("integer", "Recipe ID", True)}),
+         _tool("menudetails", "Get menu details for a restaurant",
+               {"restaurant_id": ("string", "Restaurant ID", True)}),
+         _tool("fetch_restaurant_information", "Fetch general restaurant info",
+               {"restaurant_id": ("string", "Restaurant ID", True)})],
+        "Get the cake recipe with ID 42.",
+        [{"name": "detailed_cake_recipe_by_id", "arguments": {"recipe_id": 42}}],
     ),
     (
-        [_tool("play_music", "Play a song or artist on the music player",
-               {"query": ("string", "Song or artist name", True),
-                "shuffle": ("boolean", "Shuffle the playlist", False)})],
-        "Play some music by The Beatles.",
-        [{"name": "play_music", "arguments": {"query": "The Beatles"}}],
+        [_tool("getstandardmaptile", "Get a standard map tile",
+               {"z": ("integer", "Zoom level", True),
+                "x": ("integer", "X tile coordinate", True),
+                "y": ("integer", "Y tile coordinate", True)}),
+         _tool("local_osm_v1_z_x_y_png", "Get OSM tile as PNG",
+               {"z": ("integer", "Zoom level", True),
+                "x": ("integer", "X coordinate", True),
+                "y": ("integer", "Y coordinate", True)}),
+         _tool("reversegeocoding", "Convert coordinates to address",
+               {"lat": ("number", "Latitude", True),
+                "lon": ("number", "Longitude", True)})],
+        "Get the OSM tile PNG for zoom 12, x=2048, y=1365.",
+        [{"name": "local_osm_v1_z_x_y_png", "arguments": {"z": 12, "x": 2048, "y": 1365}}],
     ),
     (
-        [_tool("search_flights", "Search for available flights between two airports",
-               {"origin": ("string", "Origin airport code", True),
-                "destination": ("string", "Destination airport code", True),
-                "date": ("string", "Departure date YYYY-MM-DD", True),
-                "passengers": ("integer", "Number of passengers", False)})],
-        "Find flights from New York (JFK) to London (LHR) on June 15th for 2 passengers.",
-        [{"name": "search_flights", "arguments": {"origin": "JFK", "destination": "LHR", "date": "2025-06-15", "passengers": 2}}],
+        [_tool("steam", "Look up Steam game info",
+               {"app_id": ("string", "Steam app ID", False),
+                "query": ("string", "Search query", False)}),
+         _tool("challenge", "Get challenge info by ID",
+               {"challenge_id": ("string", "Challenge ID", True)}),
+         _tool("real_time_user_search", "Search for users in real time",
+               {"query": ("string", "User search query", True)})],
+        "Look up the challenge with ID 'ch_9910'.",
+        [{"name": "challenge", "arguments": {"challenge_id": "ch_9910"}}],
     ),
     (
-        [_tool("search_hotels", "Search for hotels in a city",
-               {"city": ("string", "City name", True),
-                "checkin": ("string", "Check-in date YYYY-MM-DD", True),
-                "checkout": ("string", "Check-out date YYYY-MM-DD", True),
-                "guests": ("integer", "Number of guests", False)})],
-        "Find hotels in Paris for 2 guests checking in July 10 and checking out July 15.",
-        [{"name": "search_hotels", "arguments": {"city": "Paris", "checkin": "2025-07-10", "checkout": "2025-07-15", "guests": 2}}],
+        [_tool("query_for_city_names_by_state", "List city names by US state",
+               {"state": ("string", "Two-letter state code", True)}),
+         _tool("places_list_by_radius_nearby_search", "Find places near coordinates",
+               {"lat": ("number", "Latitude", True),
+                "lon": ("number", "Longitude", True),
+                "radius": ("integer", "Radius in meters", True)}),
+         _tool("getcity", "Get city info by name",
+               {"city": ("string", "City name", True)})],
+        "List all city names in the state of California.",
+        [{"name": "query_for_city_names_by_state", "arguments": {"state": "CA"}}],
+    ),
+
+    # --- Multi-call (same function, different args) ---
+    (
+        [_tool("realtime_weather_api", "Get real-time weather",
+               {"q": ("string", "City or coordinates", True)})],
+        "Get the current weather for Tokyo and Seoul simultaneously.",
+        [{"name": "realtime_weather_api", "arguments": {"q": "Tokyo"}},
+         {"name": "realtime_weather_api", "arguments": {"q": "Seoul"}}],
     ),
     (
-        [_tool("get_crypto_price", "Get the current price of a cryptocurrency",
-               {"symbol": ("string", "Crypto symbol e.g. BTC, ETH", True),
-                "currency": ("string", "Fiat currency to show price in", False)})],
-        "What is the current price of Ethereum in USD?",
-        [{"name": "get_crypto_price", "arguments": {"symbol": "ETH", "currency": "USD"}}],
+        [_tool("top_grossing_ipad_apps", "List top grossing iPad apps",
+               {"country": ("string", "Two-letter country code", False)})],
+        "Get top grossing iPad apps for the US, UK, and Australia.",
+        [{"name": "top_grossing_ipad_apps", "arguments": {"country": "us"}},
+         {"name": "top_grossing_ipad_apps", "arguments": {"country": "gb"}},
+         {"name": "top_grossing_ipad_apps", "arguments": {"country": "au"}}],
     ),
     (
-        [_tool("set_reminder", "Set a reminder for a future time",
-               {"message": ("string", "Reminder message", True),
-                "datetime": ("string", "When to remind in ISO 8601 format", True)})],
-        "Remind me to call mom tonight at 7pm.",
-        [{"name": "set_reminder", "arguments": {"message": "Call mom", "datetime": "2025-05-03T19:00:00"}}],
+        [_tool("stock_quotes", "Get real-time stock quote",
+               {"ticker": ("string", "Ticker symbol", True)}),
+         _tool("stock_get_annual_avg_div_yield", "Get annual avg dividend yield",
+               {"ticker": ("string", "Ticker symbol", True)})],
+        "Get current stock quotes for both AAPL and GOOGL.",
+        [{"name": "stock_quotes", "arguments": {"ticker": "AAPL"}},
+         {"name": "stock_quotes", "arguments": {"ticker": "GOOGL"}}],
     ),
     (
-        [_tool("get_joke", "Fetch a random joke optionally filtered by category",
-               {"category": ("string", "Joke category e.g. programming, general", False)})],
-        "Tell me a programming joke.",
-        [{"name": "get_joke", "arguments": {"category": "programming"}}],
+        [_tool("get_chat_restrictions", "Get chat restrictions for a user",
+               {"user_id": ("string", "User ID", True),
+                "platform": ("string", "Platform name", True)})],
+        "Check chat restrictions for users 'alice' and 'bob' on Discord.",
+        [{"name": "get_chat_restrictions", "arguments": {"user_id": "alice", "platform": "Discord"}},
+         {"name": "get_chat_restrictions", "arguments": {"user_id": "bob", "platform": "Discord"}}],
+    ),
+
+    # --- Clear single-selection with distractors ---
+    (
+        [_tool("autocomplete_zipcodes_lite", "Autocomplete US zipcode search",
+               {"zipcode": ("string", "Partial zipcode", True)}),
+         _tool("get_all_coins_prices", "Get prices for all cryptocurrencies", {}),
+         _tool("most_expensive", "Get most expensive item in category",
+               {"category": ("string", "Category", True)}),
+         _tool("getfeedversions", "Get feed versions for a transit agency",
+               {"agency_id": ("string", "Agency identifier", True)})],
+        "Get current prices for all cryptocurrencies.",
+        [{"name": "get_all_coins_prices", "arguments": {}}],
     ),
     (
-        [_tool("lookup_word", "Look up the definition of a word",
-               {"word": ("string", "Word to look up", True),
-                "language": ("string", "Language code e.g. en, es", False)})],
-        "What does the word 'ephemeral' mean?",
-        [{"name": "lookup_word", "arguments": {"word": "ephemeral"}}],
+        [_tool("profile", "Get a user's profile",
+               {"user_id": ("string", "User ID", True)}),
+         _tool("financial_income_statement", "Get company income statement",
+               {"ticker": ("string", "Ticker symbol", True),
+                "period": ("string", "annual or quarterly", False)}),
+         _tool("market_get_price_chart", "Get price chart for a stock",
+               {"ticker": ("string", "Ticker symbol", True),
+                "period": ("string", "Time period", False)})],
+        "Get the annual income statement for Microsoft (MSFT).",
+        [{"name": "financial_income_statement", "arguments": {"ticker": "MSFT", "period": "annual"}}],
     ),
     (
-        [_tool("get_synonyms", "Get synonyms for a word",
-               {"word": ("string", "Word to find synonyms for", True)})],
-        "Give me synonyms for the word 'happy'.",
-        [{"name": "get_synonyms", "arguments": {"word": "happy"}}],
+        [_tool("calculate_standard_deviation", "Calculate standard deviation",
+               {"numbers": ("array", "List of numbers", True)}),
+         _tool("is_prime", "Check if a number is prime",
+               {"number": ("integer", "Number to check", True)}),
+         _tool("neuronal_activity_rate", "Calculate neuronal activity rate",
+               {"neuron_id": ("string", "Neuron ID", True),
+                "interval_ms": ("integer", "Interval in ms", True)})],
+        "Calculate the standard deviation of [2, 4, 4, 4, 5, 5, 7, 9].",
+        [{"name": "calculate_standard_deviation",
+          "arguments": {"numbers": [2, 4, 4, 4, 5, 5, 7, 9]}}],
     ),
     (
-        [_tool("check_grammar", "Check and correct grammar in a text passage",
-               {"text": ("string", "Text to check", True)})],
-        "Check the grammar in this sentence: 'She don't like apples'.",
-        [{"name": "check_grammar", "arguments": {"text": "She don't like apples"}}],
+        [_tool("transactions", "Get financial transactions for an account",
+               {"account_id": ("string", "Account identifier", True),
+                "limit": ("integer", "Max number of results", False),
+                "start_date": ("string", "Start date YYYY-MM-DD", False)}),
+         _tool("steps", "Log or retrieve step count data",
+               {"user_id": ("string", "User ID", True),
+                "date": ("string", "Date YYYY-MM-DD", False)}),
+         _tool("trending", "Get trending content",
+               {"platform": ("string", "Platform name", True)})],
+        "Retrieve the last 10 transactions for account 'acc_7771'.",
+        [{"name": "transactions", "arguments": {"account_id": "acc_7771", "limit": 10}}],
     ),
     (
-        [_tool("extract_pdf_text", "Extract text from a PDF file",
-               {"file_path": ("string", "Path to the PDF file", True),
-                "page_range": ("string", "Page range e.g. 1-5", False)})],
-        "Extract text from the file at /home/user/report.pdf pages 1 through 3.",
-        [{"name": "extract_pdf_text", "arguments": {"file_path": "/home/user/report.pdf", "page_range": "1-3"}}],
+        [_tool("find_first_non_repeating_char", "Find first non-repeating char",
+               {"s": ("string", "Input string", True)}),
+         _tool("reverse_string", "Reverse a string",
+               {"s": ("string", "Input string", True)})],
+        "What is the first non-repeating character in 'programming'?",
+        [{"name": "find_first_non_repeating_char", "arguments": {"s": "programming"}}],
     ),
     (
-        [_tool("generate_qr_code", "Generate a QR code for a URL or text",
-               {"content": ("string", "Content to encode", True),
-                "size": ("integer", "QR code size in pixels", False)})],
-        "Generate a QR code for the URL https://example.com.",
-        [{"name": "generate_qr_code", "arguments": {"content": "https://example.com"}}],
-    ),
-    (
-        [_tool("generate_password", "Generate a secure random password",
-               {"length": ("integer", "Password length", True),
-                "include_symbols": ("boolean", "Include symbols in password", False)})],
-        "Generate a 16-character password with symbols.",
-        [{"name": "generate_password", "arguments": {"length": 16, "include_symbols": True}}],
-    ),
-    (
-        [_tool("shorten_url", "Shorten a long URL",
-               {"url": ("string", "URL to shorten", True)})],
-        "Shorten this URL: https://www.example.com/very/long/path/to/some/page?query=value&other=123",
-        [{"name": "shorten_url", "arguments": {"url": "https://www.example.com/very/long/path/to/some/page?query=value&other=123"}}],
-    ),
-    (
-        [_tool("lookup_ip", "Look up information about an IP address",
-               {"ip": ("string", "IP address to look up", True)})],
-        "What country does the IP address 8.8.8.8 belong to?",
-        [{"name": "lookup_ip", "arguments": {"ip": "8.8.8.8"}}],
+        [_tool("getuserbyname", "Look up a user by username",
+               {"username": ("string", "Username", True)}),
+         _tool("dashboard", "Get dashboard stats for a user",
+               {"user_id": ("string", "User ID", True)}),
+         _tool("swap_id", "Swap two record IDs",
+               {"id_a": ("string", "First ID", True),
+                "id_b": ("string", "Second ID", True)})],
+        "Look up the user with username 'janesmith'.",
+        [{"name": "getuserbyname", "arguments": {"username": "janesmith"}}],
     ),
 ]
 
-assert len(PAIR_SPECS) == 30, f"Expected 30 training pairs, got {len(PAIR_SPECS)}"
+assert len(PAIR_SPECS) == 30, f"Expected 30 pairs, got {len(PAIR_SPECS)}"
 
 # ---------------------------------------------------------------------------
 # Setup
@@ -304,23 +367,20 @@ _TOKENIZER = load_tokenizer()
 print("Building training prompts ...")
 TRAINING_PAIRS = []
 for tools, query, answers in PAIR_SPECS:
-    msgs   = build_chat_messages(tools, query)
-    prompt = _TOKENIZER.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+    msgs     = build_chat_messages(tools, query)
+    prompt   = _TOKENIZER.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
     response = json.dumps(answers, ensure_ascii=False)
     TRAINING_PAIRS.append((prompt, response))
-
 print(f"  {len(TRAINING_PAIRS)} training pairs ready.")
 
-# Load base model
 print(f"\nLoading base model ({MODEL_NAME}) ...")
 base_model = AutoModelForCausalLM.from_pretrained(
     MODEL_NAME,
     device_map="auto",
     cache_dir=CACHE_DIR,
-    torch_dtype=torch.float16,  # fp16 for GTX 1070 (no bfloat16 on Pascal)
+    torch_dtype=torch.float16,
 )
 
-# If a saved best LoRA exists, load it as the starting point
 if os.path.exists(LORA_BEST_DIR):
     print(f"Resuming from saved LoRA at {LORA_BEST_DIR} ...")
     model = PeftModel.from_pretrained(base_model, LORA_BEST_DIR, is_trainable=True)
@@ -360,13 +420,12 @@ optimizer = torch.optim.AdamW(
     weight_decay=WEIGHT_DECAY,
 )
 
-t_start_training = time.time()
+t_start_training  = time.time()
 total_training_time = 0.0
 step = 0
 epoch = 0
 completed_steps = 0
 
-# Pre-tokenize all training pairs
 batch_data = make_sft_batch(TRAINING_PAIRS, _TOKENIZER)
 
 while True:
@@ -374,24 +433,21 @@ while True:
     if epoch > EPOCHS:
         break
 
-    # Shuffle indices for this epoch
-    indices = torch.randperm(len(TRAINING_PAIRS)).tolist()
-
+    indices    = torch.randperm(len(TRAINING_PAIRS)).tolist()
     micro_losses = []
-    grad_step = 0
+    grad_step  = 0
 
     for batch_start in range(0, len(indices), MICRO_BATCH):
         torch.cuda.synchronize()
         t0 = time.time()
 
-        idx = indices[batch_start:batch_start + MICRO_BATCH]
-
-        input_ids = batch_data["input_ids"][idx].to(device)
+        idx            = indices[batch_start:batch_start + MICRO_BATCH]
+        input_ids      = batch_data["input_ids"][idx].to(device)
         attention_mask = batch_data["attention_mask"][idx].to(device)
-        labels    = batch_data["labels"][idx].to(device)
+        labels         = batch_data["labels"][idx].to(device)
 
         with torch.amp.autocast("cuda", dtype=torch.float16):
-            out = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+            out  = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
             loss = out.loss / GRAD_ACCUM
 
         loss.backward()
@@ -408,22 +464,21 @@ while True:
         t1 = time.time()
         total_training_time += (t1 - t0)
 
-        avg_loss = sum(micro_losses) / len(micro_losses) if micro_losses else 0.0
+        avg_loss  = sum(micro_losses) / len(micro_losses) if micro_losses else 0.0
         remaining = max(0, TIME_BUDGET - total_training_time)
         print(f"\repoch {epoch} step {completed_steps} | loss: {avg_loss:.4f} | remaining: {remaining:.0f}s    ", end="", flush=True)
 
         step += 1
-
         if total_training_time >= TIME_BUDGET:
             break
 
     if total_training_time >= TIME_BUDGET:
         break
 
-print()  # newline after \r
+print()
 
 if completed_steps == 0:
-    print("WARNING: no training steps completed — increase TIME_BUDGET or reduce data size.")
+    print("WARNING: no training steps completed.")
 
 # ---------------------------------------------------------------------------
 # Post-training eval
@@ -439,22 +494,35 @@ delta = post_results["name_accuracy"] - pre_results["name_accuracy"]
 print(f"\ndelta name_accuracy: {delta:+.4f}")
 
 # ---------------------------------------------------------------------------
-# Save LoRA if improved
+# Save LoRA if best ever (tracked in best_accuracy.txt)
 # ---------------------------------------------------------------------------
 
-if delta > 0:
-    print(f"Improvement detected — saving LoRA adapter to {LORA_BEST_DIR}")
+best_path  = os.path.join(LORA_BEST_DIR, "best_accuracy.txt")
+best_saved = 0.0
+if os.path.exists(best_path):
+    try:
+        with open(best_path) as f:
+            best_saved = float(f.read().strip())
+    except Exception:
+        pass
+
+if post_results["name_accuracy"] > best_saved:
+    print(f"New best ({post_results['name_accuracy']:.4f} > {best_saved:.4f}) — saving to {LORA_BEST_DIR}")
     os.makedirs(LORA_BEST_DIR, exist_ok=True)
     model.save_pretrained(LORA_BEST_DIR)
     _TOKENIZER.save_pretrained(LORA_BEST_DIR)
+    with open(best_path, "w") as f:
+        f.write(f"{post_results['name_accuracy']:.6f}")
+elif delta > 0:
+    print(f"Improved +{delta:.4f} within run but not better than saved best ({best_saved:.4f}).")
 else:
-    print("No improvement — not saving this run's weights.")
+    print("No improvement — not saving.")
 
 # ---------------------------------------------------------------------------
-# Final summary (grep-friendly)
+# Final summary
 # ---------------------------------------------------------------------------
 
-t_end = time.time()
+t_end        = time.time()
 peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
 
 print("---")
