@@ -166,7 +166,7 @@ def evaluate_function_calling(model, tokenizer, batch_size: int = 8, device: str
         with torch.amp.autocast("cuda", dtype=torch.float16):
             out_ids = model.generate(
                 **inputs,
-                max_new_tokens=64,
+                max_new_tokens=128,
                 do_sample=False,
                 pad_token_id=tokenizer.pad_token_id,
             )
@@ -178,13 +178,20 @@ def evaluate_function_calling(model, tokenizer, batch_size: int = 8, device: str
 
             # Try to parse the JSON output
             try:
-                # Model may wrap in markdown — strip fences
+                # Strip markdown fences
                 text = raw
                 if "```" in text:
                     text = text.split("```")[1]
                     if text.startswith("json"):
                         text = text[4:]
-                calls = json.loads(text.strip())
+                text = text.strip()
+                # Strip any prose preamble before the first [ or { character
+                bracket = text.find("[")
+                brace   = text.find("{")
+                if bracket >= 0 or brace >= 0:
+                    start = bracket if brace < 0 else (brace if bracket < 0 else min(bracket, brace))
+                    text = text[start:]
+                calls = json.loads(text)
                 if not isinstance(calls, list):
                     calls = [calls]
                 calls = [c for c in calls if isinstance(c, dict)]
