@@ -187,10 +187,11 @@ def evaluate_function_calling(model, tokenizer, batch_size: int = 8, device: str
                 calls = json.loads(text.strip())
                 if not isinstance(calls, list):
                     calls = [calls]
+                calls = [c for c in calls if isinstance(c, dict)]
                 n_parseable += 1
 
                 # Compare first function name
-                gt_names = [a["name"] for a in ex["answers"] if "name" in a]
+                gt_names = [a["name"] for a in ex["answers"] if isinstance(a, dict) and "name" in a]
                 pred_names = [c.get("name", "") for c in calls]
                 if gt_names and pred_names and gt_names[0] == pred_names[0]:
                     n_correct += 1
