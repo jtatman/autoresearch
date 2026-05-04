@@ -38,11 +38,11 @@ LORA_TARGETS   = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
 LEARNING_RATE  = 2e-4
 WEIGHT_DECAY   = 0.01
-EPOCHS         = 3       # passes over the 30 training pairs
+EPOCHS         = 10      # more passes — training only used 95s of 300s budget
 MICRO_BATCH    = 4       # examples per gradient step
 GRAD_ACCUM     = 2       # effective batch = MICRO_BATCH * GRAD_ACCUM = 8
 
-EVAL_BATCH     = 4       # batch size for evaluate_function_calling
+EVAL_BATCH     = 8       # larger batch speeds up eval on GTX 1070
 
 # ---------------------------------------------------------------------------
 # 30 training pairs — CHANGE THESE EACH RUN

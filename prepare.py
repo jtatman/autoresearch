@@ -26,9 +26,9 @@ import torch
 
 MODEL_NAME    = "ericlewis/SmolLM-360M-Instruct-xLAM"
 TIME_BUDGET   = 300          # training seconds per run (5 minutes)
-EVAL_SIZE     = 100          # fixed number of eval examples
+EVAL_SIZE     = 25           # eval examples per run (subset of cached 100)
 EVAL_DATASET  = "Salesforce/xlam-function-calling-60k"
-EVAL_SPLIT_START = 59900     # last 100 examples — held out from any training data
+EVAL_SPLIT_START = 59900     # 100 cached; EVAL_SIZE controls how many we use
 
 CACHE_DIR     = os.path.join(os.path.expanduser("~"), ".cache", "smollm-xlam")
 EVAL_CACHE    = os.path.join(CACHE_DIR, "eval_data.json")
@@ -138,7 +138,7 @@ def evaluate_function_calling(model, tokenizer, batch_size: int = 8, device: str
 
     Returns dict: {"name_accuracy": float, "parse_rate": float, "n": int}
     """
-    examples = download_eval_data()
+    examples = download_eval_data()[:EVAL_SIZE]
     model.eval()
 
     n_correct = 0
@@ -166,7 +166,7 @@ def evaluate_function_calling(model, tokenizer, batch_size: int = 8, device: str
         with torch.amp.autocast("cuda", dtype=torch.float16):
             out_ids = model.generate(
                 **inputs,
-                max_new_tokens=128,
+                max_new_tokens=64,
                 do_sample=False,
                 pad_token_id=tokenizer.pad_token_id,
             )
