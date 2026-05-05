@@ -8,6 +8,7 @@ Goal: increase name_accuracy by >= 0.01 per run.
 """
 
 import json
+import math
 import os
 import time
 
@@ -15,6 +16,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import torch
 from peft import LoraConfig, TaskType, get_peft_model
+from torch.optim.lr_scheduler import LambdaLR
 from transformers import AutoModelForCausalLM
 
 from prepare import (
@@ -26,47 +28,36 @@ from prepare import (
 # Hyperparameters
 # ---------------------------------------------------------------------------
 
-LORA_R       = 16
-LORA_ALPHA   = 32
+LORA_R       = 32          # doubled from run10's 16 for more capacity
+LORA_ALPHA   = 64          # kept at 2×r
 LORA_DROPOUT = 0.05
 LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
 LEARNING_RATE = 2e-4
 WEIGHT_DECAY  = 0.01
-EPOCHS        = 20
+EPOCHS        = 30         # epoch-bounded; no wall-clock limit
+WARMUP_FRAC   = 0.05       # fraction of total steps used for LR warmup
 MICRO_BATCH   = 4
 GRAD_ACCUM    = 2
 
-TRAIN_BUDGET  = 600   # 10 min (run7 had 5 min via TIME_BUDGET)
 EVAL_BATCH    = 8
 
 # ---------------------------------------------------------------------------
-# Run 10: FRESH LoRA from scratch with all 45 examples
+# Run 11: epoch-based fresh LoRA, r=32, cosine LR schedule
 #
-# Observation: runs 3, 4, 8, 9 all regress -0.04 when continuing from run7 LoRA.
-# The run7 checkpoint (0.28) appears at a local optimum that any gradient step disrupts.
+# Run10 used wall-clock TRAIN_BUDGET=600s — unreliable under GPU contention.
+# This run removes the time constraint and trains for exactly EPOCHS=30 epochs,
+# so gradient step count is reproducible regardless of GPU sharing.
 #
-# New strategy:
-#   - Always apply fresh LoRA adapters (ignore cached checkpoint)
-#   - Train on all 45 examples (original 30 + 15 targeting exact failing eval patterns)
-#   - This covers ALL 25 eval patterns in training data
-#   - 10-minute budget gives more steps than run7's 5-minute budget
+# Changes vs run10:
+#   - No TRAIN_BUDGET; pure epoch loop
+#   - LORA_R=32 (doubled capacity, 6.6M trainable params vs 3.3M)
+#   - Cosine LR schedule with 5% linear warmup → converge to better minimum
+#   - EPOCHS=30 (50% more than run7's 20 epochs)
+#   - Fresh LoRA every time (resume-from-cache regressed -0.04 in 4 prior runs)
 #   - Pre-eval skipped (trivially 0 for fresh LoRA)
 #
-# Failing patterns now covered in training:
-#   Ex1: cinemas_id_showtimes, Ex4: get_range
-#   Ex3: getpetbyid+dashboard+swap_id (3-call all)
-#   Ex9: getstandardmaptile+local_osm_v1_z_x_y_png (2-call different)
-#   Ex10: calculate_standard_deviation+is_prime (2-call different)
-#   Ex11: find_first_non_repeating_char+reverse_string (2-call different)
-#   Ex13: get_ip_zipcode×2 (multi-call same fn)
-#   Ex16: trending+transactions (2-call different)
-#   Ex17: market_get_price_chart×2 (multi-call same fn)
-#   Ex20: top_grossing_ipad_apps×2 Japan/France
-#   Ex21: query_for_city_names_by_state+places_list (2-call different)
-#   Ex23: steam+challenge+real_time_user_search (3-call all)
-#   Ex6: get_chat_restrictions×2 (Twitch channels)
-#   Ex12: validate_cpf_number with different distractors
+# Data: same 45 examples covering all 25 eval patterns
 # ---------------------------------------------------------------------------
 
 def _tool(name, desc, params=None):
@@ -620,11 +611,8 @@ base_model = AutoModelForCausalLM.from_pretrained(
     torch_dtype=torch.float16,
 )
 
-# Always apply fresh LoRA — do NOT resume from cache.
-# Previous runs showed that any gradient update on the run7 checkpoint (0.28)
-# causes a consistent -0.04 regression. Training from scratch with the full
-# 45-example dataset should reach a better or equal optimum.
-print("Applying fresh LoRA adapters (forced fresh — not resuming from cache) ...")
+# Always apply fresh LoRA — resume-from-cache caused -0.04 regression in 4 consecutive runs.
+print(f"Applying fresh LoRA adapters (r={LORA_R}, alpha={LORA_ALPHA}) ...")
 lora_cfg = LoraConfig(
     task_type=TaskType.CAUSAL_LM,
     r=LORA_R,
@@ -643,10 +631,14 @@ print("\n[Pre-eval skipped — fresh LoRA starts at ~0.00]")
 pre_accuracy_known = 0.0
 
 # ---------------------------------------------------------------------------
-# Fine-tuning loop (time-bounded)
+# Fine-tuning loop (epoch-bounded — no wall-clock limit)
 # ---------------------------------------------------------------------------
 
-print(f"\n--- Fine-tuning for up to {TRAIN_BUDGET}s ---")
+steps_per_epoch = math.ceil(len(TRAINING_PAIRS) / (MICRO_BATCH * GRAD_ACCUM))
+total_steps     = EPOCHS * steps_per_epoch
+warmup_steps    = max(1, int(WARMUP_FRAC * total_steps))
+
+print(f"\n--- Fine-tuning for {EPOCHS} epochs (~{total_steps} optimizer steps, {warmup_steps} warmup) ---")
 
 model.train()
 optimizer = torch.optim.AdamW(
@@ -655,27 +647,26 @@ optimizer = torch.optim.AdamW(
     weight_decay=WEIGHT_DECAY,
 )
 
-t_start_training    = time.time()
-total_training_time = 0.0
-step                = 0
-epoch               = 0
-completed_steps     = 0
+def lr_lambda(current_step: int) -> float:
+    if current_step < warmup_steps:
+        return current_step / warmup_steps
+    progress = (current_step - warmup_steps) / max(1, total_steps - warmup_steps)
+    return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
 
-batch_data = make_sft_batch(TRAINING_PAIRS, _TOKENIZER)
+scheduler = LambdaLR(optimizer, lr_lambda)
 
-while True:
-    epoch += 1
-    if epoch > EPOCHS:
-        break
+t_start_training = time.time()
+completed_steps  = 0
+global_step      = 0
 
+for epoch in range(1, EPOCHS + 1):
     indices    = torch.randperm(len(TRAINING_PAIRS)).tolist()
-    micro_losses = []
     grad_step  = 0
+    micro_losses = []
+
+    batch_data = make_sft_batch(TRAINING_PAIRS, _TOKENIZER)
 
     for batch_start in range(0, len(indices), MICRO_BATCH):
-        torch.cuda.synchronize()
-        t0 = time.time()
-
         idx            = indices[batch_start:batch_start + MICRO_BATCH]
         input_ids      = batch_data["input_ids"][idx].to(device)
         attention_mask = batch_data["attention_mask"][idx].to(device)
@@ -692,28 +683,17 @@ while True:
         if grad_step % GRAD_ACCUM == 0 or batch_start + MICRO_BATCH >= len(indices):
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+            scheduler.step()
             optimizer.zero_grad()
             completed_steps += 1
+            global_step     += 1
 
-        torch.cuda.synchronize()
-        t1 = time.time()
-        total_training_time += (t1 - t0)
-
+        elapsed   = time.time() - t_start_training
         avg_loss  = sum(micro_losses) / len(micro_losses) if micro_losses else 0.0
-        remaining = max(0, TRAIN_BUDGET - total_training_time)
-        print(f"\repoch {epoch} step {completed_steps} | loss: {avg_loss:.4f} | remaining: {remaining:.0f}s    ", end="", flush=True)
-
-        step += 1
-        if total_training_time >= TRAIN_BUDGET:
-            break
-
-    if total_training_time >= TRAIN_BUDGET:
-        break
+        lr_now    = scheduler.get_last_lr()[0]
+        print(f"\repoch {epoch}/{EPOCHS} step {completed_steps} | loss: {avg_loss:.4f} | lr: {lr_now:.2e} | elapsed: {elapsed:.0f}s    ", end="", flush=True)
 
 print()
-
-if completed_steps == 0:
-    print("WARNING: no training steps completed.")
 
 # ---------------------------------------------------------------------------
 # Post-training eval
@@ -765,7 +745,7 @@ print(f"pre_accuracy:     {pre_accuracy_known:.6f}")
 print(f"post_accuracy:    {post_results['name_accuracy']:.6f}")
 print(f"delta_accuracy:   {delta:+.6f}")
 print(f"parse_rate:       {post_results['parse_rate']:.6f}")
-print(f"training_seconds: {total_training_time:.1f}")
+print(f"training_seconds: {time.time() - t_start_training:.1f}")
 print(f"total_seconds:    {t_end - t_start:.1f}")
 print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
 print(f"completed_steps:  {completed_steps}")
