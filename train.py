@@ -30,7 +30,7 @@ from prepare import (
 
 LORA_R       = 16          # back to r=16; r=32 hurt in run14
 LORA_ALPHA   = 32          # 2x r
-LORA_DROPOUT = 0.0         # no dropout: pure memorization for hard truncated examples
+LORA_DROPOUT = 0.05        # restored: dropout noise helps find better optima (run17 proved 0.0 hurts)
 LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
 LEARNING_RATE = 3e-4       # run13's proven LR
@@ -38,32 +38,25 @@ WEIGHT_DECAY  = 0.01
 EPOCHS        = 60
 WARMUP_FRAC   = 0.05
 MICRO_BATCH   = 4
-GRAD_ACCUM    = 2
+GRAD_ACCUM    = 1          # effective batch=4 (was 8); 2x more gradient steps, better per-example signal
 
 EVAL_BATCH    = 8
 MAX_SEQ_LEN   = 512        # must match prepare.py's MAX_SEQ_LEN
 
 # ---------------------------------------------------------------------------
-# Run 17: exact run13 settings, LORA_DROPOUT=0.0
+# Run 18: GRAD_ACCUM=1 (effective batch 8→4), everything else = run13
 #
 # Run history:
-#   run13 (x4 uniform, r=16, LR=3e-4, dropout=0.05): 0.68 ← BEST
-#   run14 (targeted x16 + r=32):      0.56 ← regressed
-#   run15 (x8 uniform, LR=4e-4):      0.52 ← regressed
-#   run16 (minimal-resp for 8 + x4):  0.52 ← no improvement
+#   run13 (x4 hard, r=16, LR=3e-4, dropout=0.05, batch=8): 0.68 ← BEST
+#   run14-17: all regressed (r change, oversample change, LR change, dropout=0)
 #
-# Token analysis shows the 8 failing examples all truncate to ambiguous
-# contexts (partial tool list, no query visible). They need pure memorization
-# of specific context-prefix → response mappings.
+# Only one untested structural change: halving effective batch size from 8→4
+# by setting GRAD_ACCUM=1. This doubles gradient update frequency
+# (1920 steps vs 960), each step sees fewer examples → higher gradient
+# variance and more per-example signal. Smaller effective batches are
+# generally better for memorization tasks.
 #
-# Hypothesis: dropout=0.05 adds stochastic noise that prevents consistent
-# memorization of the 8 hardest examples. With dropout=0.0, every forward
-# pass uses all LoRA parameters → more stable gradient toward memorizing
-# specific hard mappings.
-#
-# Everything else identical to run13 (the proven sweet spot):
-#   x4 oversample all 18 hard, x1 easy, x1 synthetic, r=16, LR=3e-4
-#   124 pairs, ~960 steps, 60 epochs
+# Training data unchanged: 124 pairs, 60 epochs → ~1920 steps
 # ---------------------------------------------------------------------------
 
 _HARD_EVAL_INDICES = {0, 3, 5, 6, 7, 9, 10, 12, 13, 15, 16, 17, 18, 20, 21, 22, 23, 24}
