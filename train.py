@@ -37,26 +37,25 @@ LEARNING_RATE = 3e-4       # run13's proven LR
 WEIGHT_DECAY  = 0.01
 EPOCHS        = 60
 WARMUP_FRAC   = 0.05
-MICRO_BATCH   = 4
-GRAD_ACCUM    = 1          # effective batch=4 (was 8); 2x more gradient steps, better per-example signal
+MICRO_BATCH   = 2          # effective batch=2 (was 4 in run18); even more per-example gradient signal
+GRAD_ACCUM    = 1
 
 EVAL_BATCH    = 8
 MAX_SEQ_LEN   = 512        # must match prepare.py's MAX_SEQ_LEN
 
 # ---------------------------------------------------------------------------
-# Run 18: GRAD_ACCUM=1 (effective batch 8→4), everything else = run13
+# Run 19: MICRO_BATCH=2 (effective batch 4→2), everything else = run18
 #
 # Run history:
-#   run13 (x4 hard, r=16, LR=3e-4, dropout=0.05, batch=8): 0.68 ← BEST
-#   run14-17: all regressed (r change, oversample change, LR change, dropout=0)
+#   run13 (batch=8,  960 steps): 0.68
+#   run18 (batch=4, 1860 steps): 0.72 ← NEW BEST — smaller batch works!
 #
-# Only one untested structural change: halving effective batch size from 8→4
-# by setting GRAD_ACCUM=1. This doubles gradient update frequency
-# (1920 steps vs 960), each step sees fewer examples → higher gradient
-# variance and more per-example signal. Smaller effective batches are
-# generally better for memorization tasks.
+# Continue the trend: halve batch again to 2. This doubles gradient update
+# frequency again (3720 steps vs 1860), each step sees only 2 examples →
+# maximum per-example gradient signal at each update.
 #
-# Training data unchanged: 124 pairs, 60 epochs → ~1920 steps
+# Training data unchanged: 124 pairs, 60 epochs → ~3720 steps
+# Same compute as run18 (batch×steps stays roughly constant).
 # ---------------------------------------------------------------------------
 
 _HARD_EVAL_INDICES = {0, 3, 5, 6, 7, 9, 10, 12, 13, 15, 16, 17, 18, 20, 21, 22, 23, 24}
