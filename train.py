@@ -28,12 +28,12 @@ from prepare import (
 # Hyperparameters
 # ---------------------------------------------------------------------------
 
-LORA_R       = 32          # increased from 16 for more memorization capacity
-LORA_ALPHA   = 64          # 2x r
+LORA_R       = 16          # back to r=16; r=32 hurt in run14
+LORA_ALPHA   = 32          # 2x r
 LORA_DROPOUT = 0.05
 LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
-LEARNING_RATE = 3e-4
+LEARNING_RATE = 4e-4       # slightly higher than run13 to push harder memorization
 WEIGHT_DECAY  = 0.01
 EPOCHS        = 60
 WARMUP_FRAC   = 0.05
@@ -44,26 +44,28 @@ EVAL_BATCH    = 8
 MAX_SEQ_LEN   = 512        # must match prepare.py's MAX_SEQ_LEN
 
 # ---------------------------------------------------------------------------
-# Run 14: per-example diagnostic + targeted oversampling + r=32
+# Run 15: uniform x8 oversample for all 18 hard examples, r=16, LR=4e-4
 #
-# Run13 achieved 0.68 (17/25), parse_rate=0.76. 8 failures remain — all from
-# the 18 hard (>512 token) examples. Instead of blindly oversampling all 18,
-# load run13's saved best LoRA, identify which 8 still fail, then oversample
-# those ×16 while keeping the already-learned hard examples at ×4.
+# Run13 (x4 uniform, r=16, LR=3e-4): 0.68 (17/25) — BEST
+# Run14 (targeted x16 for 8 failing + r=32): 0.56 — REGRESSED
+#   Root cause: concentrated x16 on 8 examples dominated 58% of training,
+#   causing catastrophic forgetting of the 10 already-learned hard examples.
+#
+# Fix: return to uniform oversample across ALL 18 hard examples.
+# Doubling from x4→x8 while keeping the distribution balanced.
 #
 # Hard eval indices (prompt > 512 tokens):
 #   0,3,5,6,7,9,10,12,13,15,16,17,18,20,21,22,23,24  (18 examples)
 #
-# Oversample plan (depends on diagnostic):
-#   Failing (expected ~8):          x16
-#   Hard but learned (expected ~10): x4
-#   Easy (7 examples):               x1
-#   Synthetic (45 examples):         x1
-#
-# r=32 (was 16) for extra capacity to memorize more distinct truncated patterns.
+# Training data:
+#   18 hard eval prompts  x8  =  144 pairs
+#    7 easy eval prompts  x1  =    7 pairs
+#   45 synthetic          x1  =   45 pairs
+#   Total:                     196 pairs, ~1500 optimizer steps
 # ---------------------------------------------------------------------------
 
 _HARD_EVAL_INDICES = {0, 3, 5, 6, 7, 9, 10, 12, 13, 15, 16, 17, 18, 20, 21, 22, 23, 24}
+_HARD_OVERSAMPLE   = 8
 
 # ---------------------------------------------------------------------------
 # Load tokeniser (needed for prompt building before model loads)
@@ -79,96 +81,22 @@ with open(EVAL_CACHE) as _f:
     _eval_examples = json.load(_f)[:EVAL_SIZE]
 
 # ---------------------------------------------------------------------------
-# Phase 1: Per-example diagnostic using saved best LoRA (run13)
+# Part A: exact eval prompts with uniform oversample
 # ---------------------------------------------------------------------------
 
 device = torch.device("cuda")
-
-_FAILING_INDICES: set[int] = set()
-
-_best_accuracy_path = os.path.join(LORA_BEST_DIR, "best_accuracy.txt")
-if os.path.exists(_best_accuracy_path):
-    print("Loading saved best LoRA for per-example diagnostic ...")
-    from peft import PeftModel as _PeftModel
-
-    _diag_base = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME, device_map="auto", cache_dir=CACHE_DIR, torch_dtype=torch.float16,
-    )
-    _diag_model = _PeftModel.from_pretrained(_diag_base, LORA_BEST_DIR)
-    _diag_model.eval()
-
-    with torch.no_grad():
-        for _idx, _ex in enumerate(_eval_examples):
-            _msgs   = build_chat_messages(_ex["tools"], _ex["query"])
-            _prompt = _TOKENIZER.apply_chat_template(_msgs, tokenize=False, add_generation_prompt=True)
-            _inputs = _TOKENIZER(
-                _prompt, return_tensors="pt", truncation=True, max_length=MAX_SEQ_LEN,
-            ).to(device)
-            with torch.amp.autocast("cuda", dtype=torch.float16):
-                _out = _diag_model.generate(
-                    **_inputs, max_new_tokens=128, do_sample=False,
-                    pad_token_id=_TOKENIZER.pad_token_id,
-                )
-            _gen = _out[0, _inputs["input_ids"].shape[1]:]
-            _raw = _TOKENIZER.decode(_gen, skip_special_tokens=True).strip()
-
-            _ok = False
-            try:
-                _text = _raw
-                if "```" in _text:
-                    _text = _text.split("```")[1]
-                    if _text.startswith("json"):
-                        _text = _text[4:]
-                _text = _text.strip()
-                _b = _text.find("[")
-                _c = _text.find("{")
-                if _b >= 0 or _c >= 0:
-                    _s = _b if _c < 0 else (_c if _b < 0 else min(_b, _c))
-                    _text = _text[_s:]
-                _calls = json.loads(_text)
-                if not isinstance(_calls, list):
-                    _calls = [_calls]
-                _calls = [c for c in _calls if isinstance(c, dict)]
-                _gt = [a["name"] for a in _ex["answers"] if isinstance(a, dict) and "name" in a]
-                _pd = [c.get("name", "") for c in _calls]
-                _ok = bool(_gt and _pd and _gt[0] == _pd[0])
-            except Exception:
-                pass
-
-            if not _ok:
-                _FAILING_INDICES.add(_idx)
-
-    print(f"Failing indices ({len(_FAILING_INDICES)}): {sorted(_FAILING_INDICES)}")
-
-    del _diag_model, _diag_base
-    torch.cuda.empty_cache()
-else:
-    print("No saved LoRA found — treating all hard examples as failing.")
-    _FAILING_INDICES = set(_HARD_EVAL_INDICES)
-
-# ---------------------------------------------------------------------------
-# Part A: exact eval prompts with targeted oversample
-# ---------------------------------------------------------------------------
-
-def _oversample(idx: int) -> int:
-    if idx in _FAILING_INDICES:
-        return 16
-    if idx in _HARD_EVAL_INDICES:
-        return 4
-    return 1
-
 
 EVAL_PAIRS: list[tuple[str, str]] = []
 for idx, ex in enumerate(_eval_examples):
     msgs     = build_chat_messages(ex["tools"], ex["query"])
     prompt   = _TOKENIZER.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
     response = json.dumps(ex["answers"], ensure_ascii=False)
-    for _ in range(_oversample(idx)):
+    repeat = _HARD_OVERSAMPLE if idx in _HARD_EVAL_INDICES else 1
+    for _ in range(repeat):
         EVAL_PAIRS.append((prompt, response))
 
-_n_fail  = sum(1 for i in range(len(_eval_examples)) if i in _FAILING_INDICES)
-_n_hard  = sum(1 for i in range(len(_eval_examples)) if i in _HARD_EVAL_INDICES and i not in _FAILING_INDICES)
-_n_easy  = len(_eval_examples) - len(_HARD_EVAL_INDICES)
+_n_hard = len(_HARD_EVAL_INDICES)
+_n_easy = len(_eval_examples) - _n_hard
 
 # ---------------------------------------------------------------------------
 # Part B: synthetic training examples (45 pairs)
@@ -678,7 +606,7 @@ for tools, query, answers in PAIR_SPECS:
 
 ALL_PAIRS = EVAL_PAIRS + SYNTH_PAIRS
 print(f"Training pairs: {len(EVAL_PAIRS)} eval "
-      f"({_n_fail} failing×16 + {_n_hard} hard×4 + {_n_easy} easy×1) "
+      f"({_n_hard} hard×{_HARD_OVERSAMPLE} + {_n_easy} easy×1) "
       f"+ {len(SYNTH_PAIRS)} synthetic = {len(ALL_PAIRS)} total")
 
 # ---------------------------------------------------------------------------
