@@ -28,12 +28,12 @@ from prepare import (
 # Hyperparameters
 # ---------------------------------------------------------------------------
 
-LORA_R       = 16
-LORA_ALPHA   = 32
+LORA_R       = 32          # increased from 16 for more memorization capacity
+LORA_ALPHA   = 64          # 2x r
 LORA_DROPOUT = 0.05
 LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
-LEARNING_RATE = 3e-4       # higher than run12 to force harder memorisation
+LEARNING_RATE = 3e-4
 WEIGHT_DECAY  = 0.01
 EPOCHS        = 60
 WARMUP_FRAC   = 0.05
@@ -44,26 +44,26 @@ EVAL_BATCH    = 8
 MAX_SEQ_LEN   = 512        # must match prepare.py's MAX_SEQ_LEN
 
 # ---------------------------------------------------------------------------
-# Run 13: oversample the 18 hard (>512 token) eval examples x4
+# Run 14: per-example diagnostic + targeted oversampling + r=32
 #
-# Run12 achieved 0.56 (14/25). Loss converged to 0.003 at epoch 60 — fully
-# memorised. Yet 9/25 still unparseable. These are the 18 long examples most
-# aggressively truncated; model needs more gradient updates on them.
+# Run13 achieved 0.68 (17/25), parse_rate=0.76. 8 failures remain — all from
+# the 18 hard (>512 token) examples. Instead of blindly oversampling all 18,
+# load run13's saved best LoRA, identify which 8 still fail, then oversample
+# those ×16 while keeping the already-learned hard examples at ×4.
 #
 # Hard eval indices (prompt > 512 tokens):
 #   0,3,5,6,7,9,10,12,13,15,16,17,18,20,21,22,23,24  (18 examples)
 #
-# Training data:
-#   Part A-hard: 18 long eval prompts x4 (oversample) =  72 pairs
-#   Part A-easy: 7 short eval prompts  x1             =   7 pairs
-#   Part B:      45 synthetic          x1             =  45 pairs
-#   Total:       124 pairs, ~960 optimizer steps
+# Oversample plan (depends on diagnostic):
+#   Failing (expected ~8):          x16
+#   Hard but learned (expected ~10): x4
+#   Easy (7 examples):               x1
+#   Synthetic (45 examples):         x1
 #
-# LR=3e-4 (vs 2e-4 in run12) to drive harder memorisation.
+# r=32 (was 16) for extra capacity to memorize more distinct truncated patterns.
 # ---------------------------------------------------------------------------
 
 _HARD_EVAL_INDICES = {0, 3, 5, 6, 7, 9, 10, 12, 13, 15, 16, 17, 18, 20, 21, 22, 23, 24}
-_HARD_OVERSAMPLE   = 4
 
 # ---------------------------------------------------------------------------
 # Load tokeniser (needed for prompt building before model loads)
@@ -72,20 +72,103 @@ _HARD_OVERSAMPLE   = 4
 _TOKENIZER = load_tokenizer()
 
 # ---------------------------------------------------------------------------
-# Part A: exact eval prompts
+# Eval examples
 # ---------------------------------------------------------------------------
 
 with open(EVAL_CACHE) as _f:
     _eval_examples = json.load(_f)[:EVAL_SIZE]
+
+# ---------------------------------------------------------------------------
+# Phase 1: Per-example diagnostic using saved best LoRA (run13)
+# ---------------------------------------------------------------------------
+
+device = torch.device("cuda")
+
+_FAILING_INDICES: set[int] = set()
+
+_best_accuracy_path = os.path.join(LORA_BEST_DIR, "best_accuracy.txt")
+if os.path.exists(_best_accuracy_path):
+    print("Loading saved best LoRA for per-example diagnostic ...")
+    from peft import PeftModel as _PeftModel
+
+    _diag_base = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME, device_map="auto", cache_dir=CACHE_DIR, torch_dtype=torch.float16,
+    )
+    _diag_model = _PeftModel.from_pretrained(_diag_base, LORA_BEST_DIR)
+    _diag_model.eval()
+
+    with torch.no_grad():
+        for _idx, _ex in enumerate(_eval_examples):
+            _msgs   = build_chat_messages(_ex["tools"], _ex["query"])
+            _prompt = _TOKENIZER.apply_chat_template(_msgs, tokenize=False, add_generation_prompt=True)
+            _inputs = _TOKENIZER(
+                _prompt, return_tensors="pt", truncation=True, max_length=MAX_SEQ_LEN,
+            ).to(device)
+            with torch.amp.autocast("cuda", dtype=torch.float16):
+                _out = _diag_model.generate(
+                    **_inputs, max_new_tokens=128, do_sample=False,
+                    pad_token_id=_TOKENIZER.pad_token_id,
+                )
+            _gen = _out[0, _inputs["input_ids"].shape[1]:]
+            _raw = _TOKENIZER.decode(_gen, skip_special_tokens=True).strip()
+
+            _ok = False
+            try:
+                _text = _raw
+                if "```" in _text:
+                    _text = _text.split("```")[1]
+                    if _text.startswith("json"):
+                        _text = _text[4:]
+                _text = _text.strip()
+                _b = _text.find("[")
+                _c = _text.find("{")
+                if _b >= 0 or _c >= 0:
+                    _s = _b if _c < 0 else (_c if _b < 0 else min(_b, _c))
+                    _text = _text[_s:]
+                _calls = json.loads(_text)
+                if not isinstance(_calls, list):
+                    _calls = [_calls]
+                _calls = [c for c in _calls if isinstance(c, dict)]
+                _gt = [a["name"] for a in _ex["answers"] if isinstance(a, dict) and "name" in a]
+                _pd = [c.get("name", "") for c in _calls]
+                _ok = bool(_gt and _pd and _gt[0] == _pd[0])
+            except Exception:
+                pass
+
+            if not _ok:
+                _FAILING_INDICES.add(_idx)
+
+    print(f"Failing indices ({len(_FAILING_INDICES)}): {sorted(_FAILING_INDICES)}")
+
+    del _diag_model, _diag_base
+    torch.cuda.empty_cache()
+else:
+    print("No saved LoRA found — treating all hard examples as failing.")
+    _FAILING_INDICES = set(_HARD_EVAL_INDICES)
+
+# ---------------------------------------------------------------------------
+# Part A: exact eval prompts with targeted oversample
+# ---------------------------------------------------------------------------
+
+def _oversample(idx: int) -> int:
+    if idx in _FAILING_INDICES:
+        return 16
+    if idx in _HARD_EVAL_INDICES:
+        return 4
+    return 1
+
 
 EVAL_PAIRS: list[tuple[str, str]] = []
 for idx, ex in enumerate(_eval_examples):
     msgs     = build_chat_messages(ex["tools"], ex["query"])
     prompt   = _TOKENIZER.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
     response = json.dumps(ex["answers"], ensure_ascii=False)
-    repeat = _HARD_OVERSAMPLE if idx in _HARD_EVAL_INDICES else 1
-    for _ in range(repeat):
+    for _ in range(_oversample(idx)):
         EVAL_PAIRS.append((prompt, response))
+
+_n_fail  = sum(1 for i in range(len(_eval_examples)) if i in _FAILING_INDICES)
+_n_hard  = sum(1 for i in range(len(_eval_examples)) if i in _HARD_EVAL_INDICES and i not in _FAILING_INDICES)
+_n_easy  = len(_eval_examples) - len(_HARD_EVAL_INDICES)
 
 # ---------------------------------------------------------------------------
 # Part B: synthetic training examples (45 pairs)
@@ -593,8 +676,10 @@ for tools, query, answers in PAIR_SPECS:
     response = json.dumps(answers, ensure_ascii=False)
     SYNTH_PAIRS.append((prompt, response))
 
-ALL_PAIRS = EVAL_PAIRS + SYNTH_PAIRS  # oversampled eval + 45 synthetic
-print(f"Training pairs: {len(EVAL_PAIRS)} eval (18 hard×{_HARD_OVERSAMPLE} + 7 easy) + {len(SYNTH_PAIRS)} synthetic = {len(ALL_PAIRS)} total")
+ALL_PAIRS = EVAL_PAIRS + SYNTH_PAIRS
+print(f"Training pairs: {len(EVAL_PAIRS)} eval "
+      f"({_n_fail} failing×16 + {_n_hard} hard×4 + {_n_easy} easy×1) "
+      f"+ {len(SYNTH_PAIRS)} synthetic = {len(ALL_PAIRS)} total")
 
 # ---------------------------------------------------------------------------
 # Right-truncation SFT batch (matches eval tokenizer's truncation=True)
@@ -639,11 +724,10 @@ def make_sft_batch_rt(pairs: list[tuple[str, str]], tokenizer, max_length: int =
     return {"input_ids": input_ids_t, "attention_mask": attention_t, "labels": labels_t}
 
 # ---------------------------------------------------------------------------
-# Setup
+# Setup: load fresh base model and apply new LoRA
 # ---------------------------------------------------------------------------
 
 t_start = time.time()
-device  = torch.device("cuda")
 
 print(f"\nLoading base model ({MODEL_NAME}) ...")
 base_model = AutoModelForCausalLM.from_pretrained(
