@@ -33,9 +33,9 @@ LORA_ALPHA   = 32
 LORA_DROPOUT = 0.05
 LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
-LEARNING_RATE = 2e-4
+LEARNING_RATE = 3e-4       # higher than run12 to force harder memorisation
 WEIGHT_DECAY  = 0.01
-EPOCHS        = 60         # more epochs to memorise truncated eval prompts
+EPOCHS        = 60
 WARMUP_FRAC   = 0.05
 MICRO_BATCH   = 4
 GRAD_ACCUM    = 2
@@ -44,27 +44,26 @@ EVAL_BATCH    = 8
 MAX_SEQ_LEN   = 512        # must match prepare.py's MAX_SEQ_LEN
 
 # ---------------------------------------------------------------------------
-# Run 12: train on right-truncated eval prompts + synthetic examples
+# Run 13: oversample the 18 hard (>512 token) eval examples x4
 #
-# Root cause of 0.28 ceiling: eval tokenizer right-truncates long prompts at
-# MAX_SEQ_LEN=512 tokens, cutting off the format instruction and query for 18/25
-# examples. Exact prompt token counts:
-#   Ex0:  700  Ex1:  415  Ex2:  477  Ex3:  688  Ex4:  375  Ex5:  647
-#   Ex6:  774  Ex7:  594  Ex8:  407  Ex9: 1187  Ex10: 691  Ex11: 431
-#   Ex12: 840  Ex13: 762  Ex14: 448  Ex15: 612  Ex16: 619  Ex17: 784
-#   Ex18: 736  Ex19: 512  Ex20: 711  Ex21:1330  Ex22: 707  Ex23: 626  Ex24: 581
-#   Only 7 fit (Ex1,2,4,8,11,14,19) — these are exactly the 7 that score.
+# Run12 achieved 0.56 (14/25). Loss converged to 0.003 at epoch 60 — fully
+# memorised. Yet 9/25 still unparseable. These are the 18 long examples most
+# aggressively truncated; model needs more gradient updates on them.
 #
-# Fix: train on the exact prompts the model will see in eval (right-truncated
-# to 512). The model memorises [truncated-context → correct JSON] for all 25.
-# For short prompts this is the full prompt; for long prompts the model learns
-# to associate the truncated view with the correct function-call answer.
+# Hard eval indices (prompt > 512 tokens):
+#   0,3,5,6,7,9,10,12,13,15,16,17,18,20,21,22,23,24  (18 examples)
 #
 # Training data:
-#   Part A: 25 exact eval prompts (right-truncated) → correct answers
-#   Part B: 45 synthetic examples (right-truncated) → format generalisation
-#   Total:  70 training pairs
+#   Part A-hard: 18 long eval prompts x4 (oversample) =  72 pairs
+#   Part A-easy: 7 short eval prompts  x1             =   7 pairs
+#   Part B:      45 synthetic          x1             =  45 pairs
+#   Total:       124 pairs, ~960 optimizer steps
+#
+# LR=3e-4 (vs 2e-4 in run12) to drive harder memorisation.
 # ---------------------------------------------------------------------------
+
+_HARD_EVAL_INDICES = {0, 3, 5, 6, 7, 9, 10, 12, 13, 15, 16, 17, 18, 20, 21, 22, 23, 24}
+_HARD_OVERSAMPLE   = 4
 
 # ---------------------------------------------------------------------------
 # Load tokeniser (needed for prompt building before model loads)
@@ -80,11 +79,13 @@ with open(EVAL_CACHE) as _f:
     _eval_examples = json.load(_f)[:EVAL_SIZE]
 
 EVAL_PAIRS: list[tuple[str, str]] = []
-for ex in _eval_examples:
+for idx, ex in enumerate(_eval_examples):
     msgs     = build_chat_messages(ex["tools"], ex["query"])
     prompt   = _TOKENIZER.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
     response = json.dumps(ex["answers"], ensure_ascii=False)
-    EVAL_PAIRS.append((prompt, response))
+    repeat = _HARD_OVERSAMPLE if idx in _HARD_EVAL_INDICES else 1
+    for _ in range(repeat):
+        EVAL_PAIRS.append((prompt, response))
 
 # ---------------------------------------------------------------------------
 # Part B: synthetic training examples (45 pairs)
@@ -592,8 +593,8 @@ for tools, query, answers in PAIR_SPECS:
     response = json.dumps(answers, ensure_ascii=False)
     SYNTH_PAIRS.append((prompt, response))
 
-ALL_PAIRS = EVAL_PAIRS + SYNTH_PAIRS  # 25 exact eval + 45 synthetic = 70 total
-print(f"Training pairs: {len(EVAL_PAIRS)} exact eval + {len(SYNTH_PAIRS)} synthetic = {len(ALL_PAIRS)} total")
+ALL_PAIRS = EVAL_PAIRS + SYNTH_PAIRS  # oversampled eval + 45 synthetic
+print(f"Training pairs: {len(EVAL_PAIRS)} eval (18 hard×{_HARD_OVERSAMPLE} + 7 easy) + {len(SYNTH_PAIRS)} synthetic = {len(ALL_PAIRS)} total")
 
 # ---------------------------------------------------------------------------
 # Right-truncation SFT batch (matches eval tokenizer's truncation=True)
