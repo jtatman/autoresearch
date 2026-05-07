@@ -35,27 +35,25 @@ LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
 LEARNING_RATE = 3e-4       # run13's proven LR
 WEIGHT_DECAY  = 0.01
-EPOCHS        = 60
+EPOCHS        = 90         # more steps (2790 vs 1860) to push remaining 7 non-parseable over
 WARMUP_FRAC   = 0.05
-MICRO_BATCH   = 2          # effective batch=2 (was 4 in run18); even more per-example gradient signal
-GRAD_ACCUM    = 1
+MICRO_BATCH   = 4
+GRAD_ACCUM    = 1          # effective batch=4 — proven sweet spot from run18
 
 EVAL_BATCH    = 8
 MAX_SEQ_LEN   = 512        # must match prepare.py's MAX_SEQ_LEN
 
 # ---------------------------------------------------------------------------
-# Run 19: MICRO_BATCH=2 (effective batch 4→2), everything else = run18
+# Run 20: 90 epochs (2790 steps) with proven batch=4 from run18
 #
 # Run history:
-#   run13 (batch=8,  960 steps): 0.68
-#   run18 (batch=4, 1860 steps): 0.72 ← NEW BEST — smaller batch works!
+#   run13 (batch=8,  960 steps, 60ep): 0.68
+#   run18 (batch=4, 1860 steps, 60ep): 0.72 ← BEST — batch=4 sweet spot
+#   run19 (batch=2, 3720 steps, 60ep): 0.52 ← batch=2 too noisy
 #
-# Continue the trend: halve batch again to 2. This doubles gradient update
-# frequency again (3720 steps vs 1860), each step sees only 2 examples →
-# maximum per-example gradient signal at each update.
-#
-# Training data unchanged: 124 pairs, 60 epochs → ~3720 steps
-# Same compute as run18 (batch×steps stays roughly constant).
+# 7 examples still non-parseable after run18. More epochs (90 vs 60) with
+# the same proven batch=4 gives 2790 steps vs 1860 (+50%), allowing the
+# cosine LR schedule more room to fine-tune after peak.
 # ---------------------------------------------------------------------------
 
 _HARD_EVAL_INDICES = {0, 3, 5, 6, 7, 9, 10, 12, 13, 15, 16, 17, 18, 20, 21, 22, 23, 24}
