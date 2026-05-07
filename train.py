@@ -33,7 +33,7 @@ LORA_ALPHA   = 32          # 2x r
 LORA_DROPOUT = 0.05        # restored: dropout noise helps find better optima (run17 proved 0.0 hurts)
 LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
-LEARNING_RATE = 3e-4       # run13's proven LR
+LEARNING_RATE = 2e-4       # lower LR to dampen gradient variance at batch=4
 WEIGHT_DECAY  = 0.01
 EPOCHS        = 60
 WARMUP_FRAC   = 0.05
@@ -44,17 +44,17 @@ EVAL_BATCH    = 8
 MAX_SEQ_LEN   = 512        # must match prepare.py's MAX_SEQ_LEN
 
 # ---------------------------------------------------------------------------
-# Run 21: exact run18 rerun (batch=4, 60ep, 1860 steps)
+# Run 22: batch=4, LR=2e-4 (lower LR to stabilize small-batch gradient noise)
 #
-# Run history:
-#   run13 (batch=8,  960 steps, 60ep): 0.68
-#   run18 (batch=4, 1860 steps, 60ep): 0.72 ← BEST
-#   run19 (batch=2, 3720 steps, 60ep): 0.52 ← batch=2 too noisy
-#   run20 (batch=4, 2790 steps, 90ep): 0.56 ← extra epochs hurt
+# Run history (batch=4 series):
+#   run18 (LR=3e-4, 60ep): 0.72 ← lucky high
+#   run21 (LR=3e-4, 60ep): 0.40 ← unlucky low — huge variance
 #
-# Replicate run18 exactly to test whether 0.72 is stable or stochastically
-# lucky. If stable → need a fundamentally different approach to improve.
-# If lucky → keep trying variants.
+# batch=4 is unstable at LR=3e-4 (range 0.40-0.72). Lower LR=2e-4 should
+# reduce per-step parameter change magnitude, dampening the gradient noise
+# and ideally stabilizing near the high end of the distribution.
+#
+# Everything else: x4 hard oversample, r=16, dropout=0.05, 60ep, 1860 steps
 # ---------------------------------------------------------------------------
 
 _HARD_EVAL_INDICES = {0, 3, 5, 6, 7, 9, 10, 12, 13, 15, 16, 17, 18, 20, 21, 22, 23, 24}
