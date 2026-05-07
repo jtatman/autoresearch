@@ -35,7 +35,7 @@ LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
 LEARNING_RATE = 3e-4       # run13's proven LR
 WEIGHT_DECAY  = 0.01
-EPOCHS        = 90         # more steps (2790 vs 1860) to push remaining 7 non-parseable over
+EPOCHS        = 60
 WARMUP_FRAC   = 0.05
 MICRO_BATCH   = 4
 GRAD_ACCUM    = 1          # effective batch=4 — proven sweet spot from run18
@@ -44,16 +44,17 @@ EVAL_BATCH    = 8
 MAX_SEQ_LEN   = 512        # must match prepare.py's MAX_SEQ_LEN
 
 # ---------------------------------------------------------------------------
-# Run 20: 90 epochs (2790 steps) with proven batch=4 from run18
+# Run 21: exact run18 rerun (batch=4, 60ep, 1860 steps)
 #
 # Run history:
 #   run13 (batch=8,  960 steps, 60ep): 0.68
-#   run18 (batch=4, 1860 steps, 60ep): 0.72 ← BEST — batch=4 sweet spot
+#   run18 (batch=4, 1860 steps, 60ep): 0.72 ← BEST
 #   run19 (batch=2, 3720 steps, 60ep): 0.52 ← batch=2 too noisy
+#   run20 (batch=4, 2790 steps, 90ep): 0.56 ← extra epochs hurt
 #
-# 7 examples still non-parseable after run18. More epochs (90 vs 60) with
-# the same proven batch=4 gives 2790 steps vs 1860 (+50%), allowing the
-# cosine LR schedule more room to fine-tune after peak.
+# Replicate run18 exactly to test whether 0.72 is stable or stochastically
+# lucky. If stable → need a fundamentally different approach to improve.
+# If lucky → keep trying variants.
 # ---------------------------------------------------------------------------
 
 _HARD_EVAL_INDICES = {0, 3, 5, 6, 7, 9, 10, 12, 13, 15, 16, 17, 18, 20, 21, 22, 23, 24}
