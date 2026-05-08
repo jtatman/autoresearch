@@ -28,8 +28,8 @@ from prepare import (
 # Hyperparameters
 # ---------------------------------------------------------------------------
 
-LORA_R       = 16          # back to r=16; r=32 hurt in run14
-LORA_ALPHA   = 32          # 2x r
+LORA_R       = 32          # increase rank; r=32 untested with right-truncation + run13 settings
+LORA_ALPHA   = 64          # 2x r
 LORA_DROPOUT = 0.05        # restored: dropout noise helps find better optima (run17 proved 0.0 hurts)
 LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
@@ -40,32 +40,28 @@ WARMUP_FRAC   = 0.05
 MICRO_BATCH   = 4
 GRAD_ACCUM    = 2          # effective batch=8 — stable baseline (batch=4 too noisy)
 
-# Phase 2: targeted fine-tuning on the 8 consistently failing eval examples
-PHASE2_EPOCHS = 50         # 50 gradient steps at very low LR
-PHASE2_LR     = 3e-5       # 10× lower than phase 1 — nudge without catastrophic forgetting
-
 EVAL_BATCH    = 8
 MAX_SEQ_LEN   = 512        # must match prepare.py's MAX_SEQ_LEN
 
 # ---------------------------------------------------------------------------
-# Run 25: two-phase training — phase 1 = run13 exact, phase 2 = targeted
+# Run 26: r=32, attn-only, everything else = run13
 #
-# Run history:
-#   run13 (batch=8, cosine, 60ep, attn-only, x4 hard): 0.68 ← stable best
-#   run24 (+ gate/up MLP targets): 0.64 ← more params hurt
-#   run14 (x16 on 8 failing): 0.56 ← concentrated oversample → forgetting
+# Run history (right-truncation era):
+#   run13 (r=16, batch=8, cosine, 60ep, x4 hard): 0.68 ← stable best
+#   run11 (r=32, pre-truncation):            0.28 ← not a fair comparison
+#   run14 (r=32 + MLP + x16 failing):        0.56 ← too many confounds
+#   run24 (r=16 + gate/up MLP):              0.64 ← more params hurt
+#   run25 (2-phase targeted):                0.56 ← phase2 forgetting
 #
-# 8 consistently failing eval indices: {6, 9, 10, 12, 13, 15, 23, 24}
-# These have severely truncated prompts; the model reaches a local minimum
-# where those examples are stuck. Phase 1 = identical to run13 (60 epochs,
-# all 124 pairs, LR=3e-4, cosine). Phase 2 = 50 epochs on the 8 failing
-# pairs only, LR=3e-5 (10× lower) — gentle signal to re-score those
-# patterns without catastrophic forgetting of the 17 passing examples.
+# r=32 (attn-only) has never been cleanly tested with right-truncation +
+# run13's other settings. Higher rank gives the attention adapters more
+# expressive capacity to distinguish the severely-truncated hard patterns.
+# Everything else unchanged: batch=8, x4 hard oversample, LR=3e-4,
+# dropout=0.05, cosine, 60ep, 124 pairs total.
 # ---------------------------------------------------------------------------
 
-_HARD_EVAL_INDICES    = {0, 3, 5, 6, 7, 9, 10, 12, 13, 15, 16, 17, 18, 20, 21, 22, 23, 24}
-_HARD_OVERSAMPLE      = 4
-_FAILING_EVAL_INDICES = {6, 9, 10, 12, 13, 15, 23, 24}   # consistently fail across run13/23
+_HARD_EVAL_INDICES = {0, 3, 5, 6, 7, 9, 10, 12, 13, 15, 16, 17, 18, 20, 21, 22, 23, 24}
+_HARD_OVERSAMPLE   = 4
 
 # ---------------------------------------------------------------------------
 # Load tokeniser (needed for prompt building before model loads)
@@ -97,15 +93,6 @@ for idx, ex in enumerate(_eval_examples):
 
 _n_hard = len(_HARD_EVAL_INDICES)
 _n_easy = len(_eval_examples) - _n_hard
-
-# Phase-2 pairs: just the 8 consistently failing eval examples (no oversampling)
-FAILING_PAIRS: list[tuple[str, str]] = []
-for idx, ex in enumerate(_eval_examples):
-    if idx in _FAILING_EVAL_INDICES:
-        msgs     = build_chat_messages(ex["tools"], ex["query"])
-        prompt   = _TOKENIZER.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-        response = json.dumps(ex["answers"], ensure_ascii=False)
-        FAILING_PAIRS.append((prompt, response))
 
 # ---------------------------------------------------------------------------
 # Part B: synthetic training examples (45 pairs)
@@ -753,58 +740,6 @@ for epoch in range(1, EPOCHS + 1):
 print()
 
 # ---------------------------------------------------------------------------
-# Phase 2: targeted fine-tuning on consistently failing eval examples
-# ---------------------------------------------------------------------------
-
-p2_spe   = math.ceil(len(FAILING_PAIRS) / (MICRO_BATCH * GRAD_ACCUM))
-p2_steps = PHASE2_EPOCHS * p2_spe
-
-print(f"\n--- Phase 2: {PHASE2_EPOCHS} epochs on {len(FAILING_PAIRS)} failing pairs "
-      f"(~{p2_steps} steps, LR={PHASE2_LR:.0e}) ---")
-
-model.train()
-p2_optimizer = torch.optim.AdamW(
-    [p for p in model.parameters() if p.requires_grad],
-    lr=PHASE2_LR,
-    weight_decay=WEIGHT_DECAY,
-)
-p2_scheduler  = LambdaLR(p2_optimizer, lambda _: 1.0)   # constant LR
-p2_completed  = 0
-
-for p2_epoch in range(1, PHASE2_EPOCHS + 1):
-    p2_indices  = torch.randperm(len(FAILING_PAIRS)).tolist()
-    p2_grad_step = 0
-    p2_loss      = []
-    p2_batch     = make_sft_batch_rt(FAILING_PAIRS, _TOKENIZER)
-
-    for bs in range(0, len(p2_indices), MICRO_BATCH):
-        idx  = p2_indices[bs:bs + MICRO_BATCH]
-        iids = p2_batch["input_ids"][idx].to(device)
-        mask = p2_batch["attention_mask"][idx].to(device)
-        labs = p2_batch["labels"][idx].to(device)
-
-        with torch.amp.autocast("cuda", dtype=torch.float16):
-            out  = model(input_ids=iids, attention_mask=mask, labels=labs)
-            loss = out.loss / GRAD_ACCUM
-
-        loss.backward()
-        p2_loss.append(loss.item() * GRAD_ACCUM)
-        p2_grad_step += 1
-
-        if p2_grad_step % GRAD_ACCUM == 0 or bs + MICRO_BATCH >= len(p2_indices):
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            p2_optimizer.step()
-            p2_scheduler.step()
-            p2_optimizer.zero_grad()
-            p2_completed += 1
-
-    p2_avg     = sum(p2_loss) / len(p2_loss)
-    p2_elapsed = time.time() - t_train_start
-    print(f"\rphase2 {p2_epoch}/{PHASE2_EPOCHS} step {p2_completed} | loss: {p2_avg:.4f} | elapsed: {p2_elapsed:.0f}s    ", end="", flush=True)
-
-print()
-
-# ---------------------------------------------------------------------------
 # Post-training eval
 # ---------------------------------------------------------------------------
 
@@ -855,5 +790,5 @@ print(f"parse_rate:       {res['parse_rate']:.6f}")
 print(f"training_seconds: {time.time() - t_train_start:.1f}")
 print(f"total_seconds:    {t_end - t_start:.1f}")
 print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
-print(f"completed_steps:  {completed} (p1) + {p2_completed} (p2)")
-print(f"epochs:           {epoch} (p1) + {p2_epoch} (p2)")
+print(f"completed_steps:  {completed}")
+print(f"epochs:           {epoch}")
