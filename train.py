@@ -33,9 +33,9 @@ LORA_ALPHA   = 32          # 2x r
 LORA_DROPOUT = 0.05        # restored: dropout noise helps find better optima (run17 proved 0.0 hurts)
 LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
-LEARNING_RATE = 3e-4       # proven peak LR
+LEARNING_RATE = 2e-4       # lower LR test; 3e-4 proven at batch=8 but 2e-4 untested there
 WEIGHT_DECAY  = 0.01
-EPOCHS        = 60
+EPOCHS        = 60         # unchanged
 WARMUP_FRAC   = 0.05
 MICRO_BATCH   = 4
 GRAD_ACCUM    = 2          # effective batch=8 — stable baseline (batch=4 too noisy)
@@ -44,20 +44,21 @@ EVAL_BATCH    = 8
 MAX_SEQ_LEN   = 512        # must match prepare.py's MAX_SEQ_LEN
 
 # ---------------------------------------------------------------------------
-# Run 28: hard oversample ×5 (up from ×4), everything else = run13
+# Run 29: LR=2e-4 at batch=8, everything else = run13
 #
-# Run history (right-truncation era, batch=8):
-#   run13 (x4 hard, 124 pairs, 60ep): 0.68 ← stable best
-#   run27 (no synthetic, 79 pairs):   0.40 ← synthetic IS essential
-#   run15 (x8 hard, LR=4e-4):         0.52 ← too much + higher LR confounded
+# Run history (right-truncation era, batch=8, LR variations):
+#   run13 (LR=3e-4, x4 hard, 124 pairs, 60ep): 0.68 ← stable best
+#   run15 (LR=4e-4, x8 hard):                  0.52 ← confounded (higher oversample too)
+#   run22 (LR=2e-4, batch=4):                   0.56 ← batch=4 noisy, not comparable
 #
-# x5 hard oversample is a clean single-variable change: run15 combined x8
-# AND LR=4e-4 (two changes). Pure x5 at LR=3e-4 hasn't been tested.
-# 18×5 + 7×1 + 45 = 142 pairs; 60 epochs ≈ 1065 steps (vs run13's 930).
+# LR=2e-4 at batch=8 has never been cleanly tested. Lower LR may converge
+# more carefully on the 8 hard truncated-prompt patterns, finding a different
+# local minimum. Everything else = run13: x4 hard oversample, 124 pairs,
+# 60ep, r=16/alpha=32, dropout=0.05, cosine.
 # ---------------------------------------------------------------------------
 
 _HARD_EVAL_INDICES = {0, 3, 5, 6, 7, 9, 10, 12, 13, 15, 16, 17, 18, 20, 21, 22, 23, 24}
-_HARD_OVERSAMPLE   = 5    # increased from 4; run15 tested x8+LR=4e-4 (confounded); x5 clean test
+_HARD_OVERSAMPLE   = 4
 
 # ---------------------------------------------------------------------------
 # Load tokeniser (needed for prompt building before model loads)
