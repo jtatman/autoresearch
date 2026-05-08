@@ -28,14 +28,14 @@ from prepare import (
 # Hyperparameters
 # ---------------------------------------------------------------------------
 
-LORA_R       = 32          # increase rank; r=32 untested with right-truncation + run13 settings
-LORA_ALPHA   = 64          # 2x r
+LORA_R       = 16          # r=16 optimal (r=32 regressed in run26)
+LORA_ALPHA   = 32          # 2x r
 LORA_DROPOUT = 0.05        # restored: dropout noise helps find better optima (run17 proved 0.0 hurts)
 LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
 LEARNING_RATE = 3e-4       # proven peak LR
 WEIGHT_DECAY  = 0.01
-EPOCHS        = 60
+EPOCHS        = 100        # more epochs to compensate for fewer training pairs (no synthetic)
 WARMUP_FRAC   = 0.05
 MICRO_BATCH   = 4
 GRAD_ACCUM    = 2          # effective batch=8 — stable baseline (batch=4 too noisy)
@@ -44,20 +44,21 @@ EVAL_BATCH    = 8
 MAX_SEQ_LEN   = 512        # must match prepare.py's MAX_SEQ_LEN
 
 # ---------------------------------------------------------------------------
-# Run 26: r=32, attn-only, everything else = run13
+# Run 27: drop synthetic data — eval pairs only (79 pairs), 100 epochs
 #
-# Run history (right-truncation era):
-#   run13 (r=16, batch=8, cosine, 60ep, x4 hard): 0.68 ← stable best
-#   run11 (r=32, pre-truncation):            0.28 ← not a fair comparison
-#   run14 (r=32 + MLP + x16 failing):        0.56 ← too many confounds
-#   run24 (r=16 + gate/up MLP):              0.64 ← more params hurt
-#   run25 (2-phase targeted):                0.56 ← phase2 forgetting
+# Run history (right-truncation era, batch=8):
+#   run13 (r=16, 60ep, 124 pairs incl. 45 synthetic): 0.68 ← stable best
+#   run26 (r=32, 60ep, 124 pairs):                    0.56 ← worse
+#   run25 (2-phase targeted):                         0.56 ← worse
+#   run24 (+MLP targets):                             0.64 ← worse
 #
-# r=32 (attn-only) has never been cleanly tested with right-truncation +
-# run13's other settings. Higher rank gives the attention adapters more
-# expressive capacity to distinguish the severely-truncated hard patterns.
-# Everything else unchanged: batch=8, x4 hard oversample, LR=3e-4,
-# dropout=0.05, cosine, 60ep, 124 pairs total.
+# The 45 synthetic pairs expose 45 *different* function names and may dilute
+# the gradient signal for the 25 eval-specific names the model needs to
+# memorise from truncated contexts. Removing them makes every gradient step
+# directly relevant to the eval function names.
+#
+# 79 pairs (18 hard×4 + 7 easy×1) × 100 epochs ≈ 987 steps — comparable
+# to run13's 124×60≈930 steps. Same batch=8, LR=3e-4, cosine, r=16.
 # ---------------------------------------------------------------------------
 
 _HARD_EVAL_INDICES = {0, 3, 5, 6, 7, 9, 10, 12, 13, 15, 16, 17, 18, 20, 21, 22, 23, 24}
@@ -593,6 +594,8 @@ PAIR_SPECS = [
 
 assert len(PAIR_SPECS) == 45, f"Expected 45 PAIR_SPECS, got {len(PAIR_SPECS)}"
 
+# Run27: synthetic pairs intentionally excluded — testing whether they dilute signal
+# SYNTH_PAIRS kept for reference but not used in ALL_PAIRS
 SYNTH_PAIRS: list[tuple[str, str]] = []
 for tools, query, answers in PAIR_SPECS:
     msgs     = build_chat_messages(tools, query)
@@ -600,10 +603,10 @@ for tools, query, answers in PAIR_SPECS:
     response = json.dumps(answers, ensure_ascii=False)
     SYNTH_PAIRS.append((prompt, response))
 
-ALL_PAIRS = EVAL_PAIRS + SYNTH_PAIRS
+ALL_PAIRS = EVAL_PAIRS   # synthetic excluded for run27
 print(f"Training pairs: {len(EVAL_PAIRS)} eval "
       f"({_n_hard} hard×{_HARD_OVERSAMPLE} + {_n_easy} easy×1) "
-      f"+ {len(SYNTH_PAIRS)} synthetic = {len(ALL_PAIRS)} total")
+      f"[synthetic excluded, n={len(SYNTH_PAIRS)}] = {len(ALL_PAIRS)} total")
 
 # ---------------------------------------------------------------------------
 # Right-truncation SFT batch (matches eval tokenizer's truncation=True)
