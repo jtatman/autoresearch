@@ -33,9 +33,9 @@ LORA_ALPHA   = 32          # 2x r
 LORA_DROPOUT = 0.05        # restored: dropout noise helps find better optima (run17 proved 0.0 hurts)
 LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
-LEARNING_RATE = 2e-4       # lower LR test; 3e-4 proven at batch=8 but 2e-4 untested there
+LEARNING_RATE = 4e-4       # higher LR clean test; run15 had 4e-4+x8 oversample (confounded)
 WEIGHT_DECAY  = 0.01
-EPOCHS        = 60         # unchanged
+EPOCHS        = 60
 WARMUP_FRAC   = 0.05
 MICRO_BATCH   = 4
 GRAD_ACCUM    = 2          # effective batch=8 — stable baseline (batch=4 too noisy)
@@ -44,17 +44,16 @@ EVAL_BATCH    = 8
 MAX_SEQ_LEN   = 512        # must match prepare.py's MAX_SEQ_LEN
 
 # ---------------------------------------------------------------------------
-# Run 29: LR=2e-4 at batch=8, everything else = run13
+# Run 30: LR=4e-4 at batch=8 with x4 oversample — clean higher-LR test
 #
 # Run history (right-truncation era, batch=8, LR variations):
-#   run13 (LR=3e-4, x4 hard, 124 pairs, 60ep): 0.68 ← stable best
-#   run15 (LR=4e-4, x8 hard):                  0.52 ← confounded (higher oversample too)
-#   run22 (LR=2e-4, batch=4):                   0.56 ← batch=4 noisy, not comparable
+#   run13 (LR=3e-4, x4 hard): 0.68 ← stable best
+#   run29 (LR=2e-4, x4 hard): 0.60 ← lower LR worse
+#   run15 (LR=4e-4, x8 hard): 0.52 ← confounded: both higher LR AND x8 oversample
 #
-# LR=2e-4 at batch=8 has never been cleanly tested. Lower LR may converge
-# more carefully on the 8 hard truncated-prompt patterns, finding a different
-# local minimum. Everything else = run13: x4 hard oversample, 124 pairs,
-# 60ep, r=16/alpha=32, dropout=0.05, cosine.
+# LR=4e-4 with x4 oversample (run13's oversample) never cleanly tested.
+# Higher LR may escape the local minimum that 3e-4 settles into, though
+# run29 shows 3e-4 is already the peak. Everything else = run13.
 # ---------------------------------------------------------------------------
 
 _HARD_EVAL_INDICES = {0, 3, 5, 6, 7, 9, 10, 12, 13, 15, 16, 17, 18, 20, 21, 22, 23, 24}
