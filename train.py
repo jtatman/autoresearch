@@ -31,12 +31,11 @@ from prepare import (
 LORA_R       = 16          # back to r=16; r=32 hurt in run14
 LORA_ALPHA   = 32          # 2x r
 LORA_DROPOUT = 0.05        # restored: dropout noise helps find better optima (run17 proved 0.0 hurts)
-LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj"]
+LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj"]
 
 LEARNING_RATE = 3e-4       # proven peak LR
 WEIGHT_DECAY  = 0.01
 EPOCHS        = 60
-RESTART_STEPS = 320        # cosine warm-restart cycle T_0 (cycles: 320, 640, 960 = ~60 epochs)
 WARMUP_FRAC   = 0.05
 MICRO_BATCH   = 4
 GRAD_ACCUM    = 2          # effective batch=8 — stable baseline (batch=4 too noisy)
@@ -45,20 +44,18 @@ EVAL_BATCH    = 8
 MAX_SEQ_LEN   = 512        # must match prepare.py's MAX_SEQ_LEN
 
 # ---------------------------------------------------------------------------
-# Run 23: cosine annealing WITH WARM RESTARTS (batch=8 stable baseline)
+# Run 24: expand LoRA targets to include MLP layers (gate_proj, up_proj)
 #
 # Run history:
-#   run13 (batch=8, cosine-once, 60ep): 0.68 ← stable best with batch=8
-#   run18 (batch=4, cosine-once, 60ep): 0.72 ← lucky; mean ~0.56 across 3 runs
+#   run13 (batch=8, cosine-once, 60ep, attn-only): 0.68 ← stable batch=8 best
+#   run23 (batch=8, warm-restarts,  60ep, attn-only): 0.68 ← warm restarts didn't help
+#   run5  (MLP targets, pre-right-truncation): 0.20 ← not a fair comparison
 #
-# Warm restarts periodically reset LR to max, forcing the model to escape
-# local minima and explore more of parameter space. T_0=320 steps, T_mult=2
-# gives cycles of 320 → 640 → 960 steps (≈ 1920 total, close to 60×16=960).
-# Wait, 960 steps for batch=8 60ep. Cycles: 320+640=960 = exactly 60 epochs.
-# So we get 2 full warm-restart cycles within the training run.
-#
+# With right-truncation established, adding gate_proj + up_proj (~triples
+# trainable params: ~3.3M → ~9.9M) gives the model more capacity to memorise
+# the truncated hard patterns. Run5's failure was before the truncation fix.
 # Everything else = run13: batch=8, x4 hard oversample, r=16, LR=3e-4,
-# dropout=0.05, 60ep, 960 steps.
+# dropout=0.05, single cosine LR, 60ep.
 # ---------------------------------------------------------------------------
 
 _HARD_EVAL_INDICES = {0, 3, 5, 6, 7, 9, 10, 12, 13, 15, 16, 17, 18, 20, 21, 22, 23, 24}
@@ -695,17 +692,11 @@ optimizer = torch.optim.AdamW(
 )
 
 def lr_lambda(current_step: int) -> float:
-    # Linear warmup
+    # Linear warmup then cosine decay to 0
     if current_step < warmup_steps:
         return current_step / warmup_steps
-    # Cosine annealing with warm restarts (T_0=RESTART_STEPS, T_mult=2)
-    t = current_step - warmup_steps
-    T_cur = t
-    T_i = RESTART_STEPS
-    while T_cur >= T_i:
-        T_cur -= T_i
-        T_i *= 2
-    return max(0.0, 0.5 * (1.0 + math.cos(math.pi * T_cur / T_i)))
+    progress = (current_step - warmup_steps) / max(1, total_steps - warmup_steps)
+    return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
 
 scheduler     = LambdaLR(optimizer, lr_lambda)
 t_train_start = time.time()
