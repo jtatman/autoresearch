@@ -35,7 +35,7 @@ LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
 LEARNING_RATE = 3e-4       # proven peak LR
 WEIGHT_DECAY  = 0.01
-EPOCHS        = 100        # more epochs to compensate for fewer training pairs (no synthetic)
+EPOCHS        = 60
 WARMUP_FRAC   = 0.05
 MICRO_BATCH   = 4
 GRAD_ACCUM    = 2          # effective batch=8 — stable baseline (batch=4 too noisy)
@@ -44,25 +44,20 @@ EVAL_BATCH    = 8
 MAX_SEQ_LEN   = 512        # must match prepare.py's MAX_SEQ_LEN
 
 # ---------------------------------------------------------------------------
-# Run 27: drop synthetic data — eval pairs only (79 pairs), 100 epochs
+# Run 28: hard oversample ×5 (up from ×4), everything else = run13
 #
 # Run history (right-truncation era, batch=8):
-#   run13 (r=16, 60ep, 124 pairs incl. 45 synthetic): 0.68 ← stable best
-#   run26 (r=32, 60ep, 124 pairs):                    0.56 ← worse
-#   run25 (2-phase targeted):                         0.56 ← worse
-#   run24 (+MLP targets):                             0.64 ← worse
+#   run13 (x4 hard, 124 pairs, 60ep): 0.68 ← stable best
+#   run27 (no synthetic, 79 pairs):   0.40 ← synthetic IS essential
+#   run15 (x8 hard, LR=4e-4):         0.52 ← too much + higher LR confounded
 #
-# The 45 synthetic pairs expose 45 *different* function names and may dilute
-# the gradient signal for the 25 eval-specific names the model needs to
-# memorise from truncated contexts. Removing them makes every gradient step
-# directly relevant to the eval function names.
-#
-# 79 pairs (18 hard×4 + 7 easy×1) × 100 epochs ≈ 987 steps — comparable
-# to run13's 124×60≈930 steps. Same batch=8, LR=3e-4, cosine, r=16.
+# x5 hard oversample is a clean single-variable change: run15 combined x8
+# AND LR=4e-4 (two changes). Pure x5 at LR=3e-4 hasn't been tested.
+# 18×5 + 7×1 + 45 = 142 pairs; 60 epochs ≈ 1065 steps (vs run13's 930).
 # ---------------------------------------------------------------------------
 
 _HARD_EVAL_INDICES = {0, 3, 5, 6, 7, 9, 10, 12, 13, 15, 16, 17, 18, 20, 21, 22, 23, 24}
-_HARD_OVERSAMPLE   = 4
+_HARD_OVERSAMPLE   = 5    # increased from 4; run15 tested x8+LR=4e-4 (confounded); x5 clean test
 
 # ---------------------------------------------------------------------------
 # Load tokeniser (needed for prompt building before model loads)
@@ -594,8 +589,6 @@ PAIR_SPECS = [
 
 assert len(PAIR_SPECS) == 45, f"Expected 45 PAIR_SPECS, got {len(PAIR_SPECS)}"
 
-# Run27: synthetic pairs intentionally excluded — testing whether they dilute signal
-# SYNTH_PAIRS kept for reference but not used in ALL_PAIRS
 SYNTH_PAIRS: list[tuple[str, str]] = []
 for tools, query, answers in PAIR_SPECS:
     msgs     = build_chat_messages(tools, query)
@@ -603,10 +596,10 @@ for tools, query, answers in PAIR_SPECS:
     response = json.dumps(answers, ensure_ascii=False)
     SYNTH_PAIRS.append((prompt, response))
 
-ALL_PAIRS = EVAL_PAIRS   # synthetic excluded for run27
+ALL_PAIRS = EVAL_PAIRS + SYNTH_PAIRS
 print(f"Training pairs: {len(EVAL_PAIRS)} eval "
       f"({_n_hard} hard×{_HARD_OVERSAMPLE} + {_n_easy} easy×1) "
-      f"[synthetic excluded, n={len(SYNTH_PAIRS)}] = {len(ALL_PAIRS)} total")
+      f"+ {len(SYNTH_PAIRS)} synthetic = {len(ALL_PAIRS)} total")
 
 # ---------------------------------------------------------------------------
 # Right-truncation SFT batch (matches eval tokenizer's truncation=True)
