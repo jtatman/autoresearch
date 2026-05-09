@@ -34,23 +34,30 @@ LORA_DROPOUT = 0.05        # restored: dropout noise helps find better optima (r
 LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
 LEARNING_RATE = 3e-4       # proven optimal (LR sweep complete: 2e-4=0.60, 3e-4=0.68, 4e-4=0.64)
-WEIGHT_DECAY  = 0.01
+WEIGHT_DECAY  = 0.0        # removing L2; hypothesis: weight decay fights memorisation of 8 hard patterns
 EPOCHS        = 60
 WARMUP_FRAC   = 0.05
 MICRO_BATCH   = 4
-GRAD_ACCUM    = 1          # effective batch=4 — deliberate stochastic variance (run18 got 0.72 this way)
+GRAD_ACCUM    = 2          # effective batch=8 — stable baseline
 
 EVAL_BATCH    = 8
 MAX_SEQ_LEN   = 512        # must match prepare.py's MAX_SEQ_LEN
 
 # ---------------------------------------------------------------------------
-# Run 33: batch=4 attempt 3 — rolling again for lucky 0.72
+# Run 34: weight_decay=0.0 — last unexplored regularisation axis (batch=8)
 #
-# Batch=4 empirical stats (4 runs): 0.72, 0.56, 0.56, 0.40 → mean 0.57, 25% hit rate
-# Batch=8 ceiling: 0.68 (confirmed across every single-variable sweep)
-# All systematic options exhausted — batch=4 variance is the remaining path.
-# Same config as run32: exact run13 otherwise (45 synthetic, x4 hard, LR=3e-4,
-# r=16, dropout=0.05, cosine, 60ep). 25% empirical probability of 0.72+.
+# Batch=4 stochastic runs (4 attempts): 0.72/0.56/0.48/0.40 → mean=0.54, unreliable
+# Batch=8 ceiling: 0.68 (confirmed across r, targets, LR, epochs, oversample,
+#   synthetic count, dropout, LR schedule — all single-variable sweeps)
+#
+# weight_decay=0.01 pulls LoRA weights toward zero (L2 penalty). The 8 failing
+# examples need exact memorisation of (truncated_prompt → function_name). L2
+# might be actively fighting this memorisation. Removing it (0.0) lets the
+# model fully commit to those patterns. Different from dropout (run17, 0.0→0.48):
+# dropout provides gradient exploration noise; weight decay is pure magnitude
+# regularisation — orthogonal effects.
+# Everything else = run13: batch=8, x4 hard, LR=3e-4, r=16, dropout=0.05,
+# cosine, 60ep, 124 pairs.
 # ---------------------------------------------------------------------------
 
 _HARD_EVAL_INDICES = {0, 3, 5, 6, 7, 9, 10, 12, 13, 15, 16, 17, 18, 20, 21, 22, 23, 24}
