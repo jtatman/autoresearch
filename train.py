@@ -34,7 +34,9 @@ LORA_DROPOUT = 0.05        # restored: dropout noise helps find better optima (r
 LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
 LEARNING_RATE = 3e-4       # proven optimal (LR sweep complete: 2e-4=0.60, 3e-4=0.68, 4e-4=0.64)
-WEIGHT_DECAY  = 0.0        # removing L2; hypothesis: weight decay fights memorisation of 8 hard patterns
+WEIGHT_DECAY  = 0.01       # confirmed optimal (0.0→0.56 in run34)
+
+GRAD_CLIP     = 0.5        # tighter clip vs default 1.0 — final unexplored knob
 EPOCHS        = 60
 WARMUP_FRAC   = 0.05
 MICRO_BATCH   = 4
@@ -44,20 +46,18 @@ EVAL_BATCH    = 8
 MAX_SEQ_LEN   = 512        # must match prepare.py's MAX_SEQ_LEN
 
 # ---------------------------------------------------------------------------
-# Run 34: weight_decay=0.0 — last unexplored regularisation axis (batch=8)
+# Run 35: grad_clip=0.5 — final unexplored knob; declare done after this
 #
-# Batch=4 stochastic runs (4 attempts): 0.72/0.56/0.48/0.40 → mean=0.54, unreliable
-# Batch=8 ceiling: 0.68 (confirmed across r, targets, LR, epochs, oversample,
-#   synthetic count, dropout, LR schedule — all single-variable sweeps)
+# Exhausted batch=8 single-variable sweeps (ceiling = 0.68):
+#   r=16✓  attn-only targets✓  LR=3e-4✓  60ep✓  x4 oversample✓
+#   45 synthetic✓  dropout=0.05✓  weight_decay=0.01✓  cosine LR✓
+# Batch=4 stochastic (4 runs): 0.72(once)/0.56/0.48/0.40 → mean=0.54
 #
-# weight_decay=0.01 pulls LoRA weights toward zero (L2 penalty). The 8 failing
-# examples need exact memorisation of (truncated_prompt → function_name). L2
-# might be actively fighting this memorisation. Removing it (0.0) lets the
-# model fully commit to those patterns. Different from dropout (run17, 0.0→0.48):
-# dropout provides gradient exploration noise; weight decay is pure magnitude
-# regularisation — orthogonal effects.
+# Gradient clip = 0.5 (vs default 1.0): tighter clip limits update magnitude,
+# potentially allowing more careful convergence on hard truncated patterns.
+# If this also ≤ 0.68, the search is complete: best result is run18's 0.72.
 # Everything else = run13: batch=8, x4 hard, LR=3e-4, r=16, dropout=0.05,
-# cosine, 60ep, 124 pairs.
+# weight_decay=0.01, cosine, 60ep, 124 pairs.
 # ---------------------------------------------------------------------------
 
 _HARD_EVAL_INDICES = {0, 3, 5, 6, 7, 9, 10, 12, 13, 15, 16, 17, 18, 20, 21, 22, 23, 24}
@@ -727,7 +727,7 @@ for epoch in range(1, EPOCHS + 1):
         grad_step += 1
 
         if grad_step % GRAD_ACCUM == 0 or bs + MICRO_BATCH >= len(indices):
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
