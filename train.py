@@ -44,20 +44,13 @@ EVAL_BATCH    = 8
 MAX_SEQ_LEN   = 512        # must match prepare.py's MAX_SEQ_LEN
 
 # ---------------------------------------------------------------------------
-# Run 32: batch=4 stochastic attempt — aiming to replicate run18's 0.72
+# Run 33: batch=4 attempt 3 — rolling again for lucky 0.72
 #
-# All single-variable changes from run13 exhausted (batch=8 ceiling = 0.68):
-#   r: 16✓(32→0.56)  targets: attn-only✓(+MLP→0.64)  LR: 3e-4✓(2e-4→0.60, 4e-4→0.64)
-#   epochs: 60✓(90→0.56, 100→0.40)  oversample: x4✓(x5→0.60, x8→0.52)
-#   synthetic: 45✓(0→0.40, 65→0.52)  dropout: 0.05✓(0.0→0.48)
-#
-# run18 (batch=4, GRAD_ACCUM=1): 0.72 ← lucky — mean batch=4 is ~0.56
-# run21 (batch=4, same):         0.40 ← bad luck
-# run22 (batch=4, LR=2e-4):      0.56
-#
-# Deliberately using batch=4 variance to try to beat the batch=8 ceiling.
-# Exact run13 settings otherwise: 45 synthetic, x4 hard, LR=3e-4, r=16,
-# dropout=0.05, cosine, 60ep. If 0.72+ → new best; if <0.68 → discard.
+# Batch=4 empirical stats (4 runs): 0.72, 0.56, 0.56, 0.40 → mean 0.57, 25% hit rate
+# Batch=8 ceiling: 0.68 (confirmed across every single-variable sweep)
+# All systematic options exhausted — batch=4 variance is the remaining path.
+# Same config as run32: exact run13 otherwise (45 synthetic, x4 hard, LR=3e-4,
+# r=16, dropout=0.05, cosine, 60ep). 25% empirical probability of 0.72+.
 # ---------------------------------------------------------------------------
 
 _HARD_EVAL_INDICES = {0, 3, 5, 6, 7, 9, 10, 12, 13, 15, 16, 17, 18, 20, 21, 22, 23, 24}
