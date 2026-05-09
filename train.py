@@ -46,18 +46,15 @@ EVAL_BATCH    = 8
 MAX_SEQ_LEN   = 512        # must match prepare.py's MAX_SEQ_LEN
 
 # ---------------------------------------------------------------------------
-# Run 35: grad_clip=0.5 — final unexplored knob; declare done after this
+# Run 36: grad_clip=0.5 reproducibility check — run35 got 0.72 with batch=8!
 #
-# Exhausted batch=8 single-variable sweeps (ceiling = 0.68):
-#   r=16✓  attn-only targets✓  LR=3e-4✓  60ep✓  x4 oversample✓
-#   45 synthetic✓  dropout=0.05✓  weight_decay=0.01✓  cosine LR✓
-# Batch=4 stochastic (4 runs): 0.72(once)/0.56/0.48/0.40 → mean=0.54
+# run35 (grad_clip=0.5, batch=8): 0.72 — FIRST batch=8 result at 0.72 (18/25)
+# Previously batch=8 was capped at 0.68 across all single-variable sweeps.
+# run18 (grad_clip=1.0, batch=4): 0.72 — only previous 0.72, was stochastic.
 #
-# Gradient clip = 0.5 (vs default 1.0): tighter clip limits update magnitude,
-# potentially allowing more careful convergence on hard truncated patterns.
-# If this also ≤ 0.68, the search is complete: best result is run18's 0.72.
-# Everything else = run13: batch=8, x4 hard, LR=3e-4, r=16, dropout=0.05,
-# weight_decay=0.01, cosine, 60ep, 124 pairs.
+# If run36 also gets 0.72, grad_clip=0.5 is a genuine stable improvement
+# over the 0.68 batch=8 ceiling. If it regresses, run35 may have been lucky.
+# Identical config to run35: grad_clip=0.5, batch=8, everything else = run13.
 # ---------------------------------------------------------------------------
 
 _HARD_EVAL_INDICES = {0, 3, 5, 6, 7, 9, 10, 12, 13, 15, 16, 17, 18, 20, 21, 22, 23, 24}
