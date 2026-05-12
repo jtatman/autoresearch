@@ -64,16 +64,21 @@ All 36 runs committed to git. Results tracked in `results.tsv`.
   - Custom `evaluate_with_thinking()` — strips `<think>` before JSON parse, reports `think_rate`
   - Uses separate best-model dir: `~/.cache/smollm-xlam/best_lora_exp2/`
 
-### Blocked on: ANTHROPIC_API_KEY
+### Think block generation — pre-generate in session, not at train time
 
-`ANTHROPIC_API_KEY` is set in `~/.bashrc` (line 144) but shows as empty in the Claude Code shell environment (Claude Code appears to blank it). `bash -c 'source ~/.bashrc && ...'` doesn't help — the variable stays empty after sourcing, suggesting something clears it post-source.
+`train2.py` calls `generate_xlam_think_blocks()` which checks for
+`~/.cache/smollm-xlam/xlam_think_blocks.json` first and skips generation
+if it exists. The right approach: generate the 70 think blocks (25 eval +
+45 synthetic) directly in a Claude Code session (using native capabilities /
+MCP tools), write them to the cache file, then `train2.py` loads from cache
+and never needs to call any external API itself.
 
-**To unblock:** before running `uv run python3 train2.py`, the API key needs to be live in the shell. Options:
-1. Open a fresh terminal (not inside Claude Code), `source ~/.bashrc`, then run manually
-2. Or: set `ANTHROPIC_API_KEY` in a `.env` file in the project dir and have `train2.py` load it with `python-dotenv`
-3. Or: switch think-block generation to use `subprocess` calling the `claude` CLI at `/home/james/.local/bin/claude` (already authenticated via Pro account)
-
-Option 3 is probably cleanest since the claude CLI is already auth'd — no key needed.
+**To prepare before first run:**
+1. Start a Claude Code session in this worktree
+2. Ask Claude to generate think blocks for all 70 xlam pairs and write to
+   `~/.cache/smollm-xlam/xlam_think_blocks.json` in the expected format:
+   `{"eval_0": {"think": "...", "answer": "[{...}]"}, "synth_0": {...}, ...}`
+3. Then `uv run python3 train2.py` will load from cache and run clean
 
 ---
 
