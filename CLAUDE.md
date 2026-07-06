@@ -142,7 +142,8 @@ Between thematic runs, only `ENDPOINT` and `QUERY` change. The loop logic never 
 |-----|-----------|------|-----------|---------|-------|
 | test-1 | flood myth | killed (head pipe) | ~50 | ~2,100 | Pre-fix, concept field blank |
 | test-2 | flood myth | killed (timeout 20s) | ~12 | ~510 | Post-fix, concepts correct |
-| — | — | — | — | — | Real run not yet started |
+| run-1  | flood myth | queue exhausted (Phase 1) | 476 | 16,306 | Full Phase 1 BFS complete |
+| run-2  | flood myth | pending | — | — | Phase 1 + Phase 2 centroid burndown |
 
 Delete `research.db` and `loop_state.json` to start fresh. Both gitignored.
 
@@ -165,23 +166,41 @@ https://github.com/cli/cli/releases if newer features are needed.
 
 ---
 
-## Phase 2 Preview
+## Phase 2: Centroid Burndown (implemented)
 
-When Phase 1 exhausts interesting connections (likely quickly — the BFS will saturate
-the 270 known cross-tradition entities fast), Phase 2 options:
+When Phase 1 BFS exhausts, `run_loop()` automatically transitions to Phase 2:
 
-1. **Direct Qdrant access** — bypass the API; query `chapters_dense` and `chapters_colbert`
-   collections directly for more complex relationship queries. Collection details in
-   `~/autoresearch/grand_bible/CLAUDE.md`.
+1. **Centroid computation** — for each of the 20 archetypes, batch-fetch the 384-dim
+   vectors of all seed chunks (from `concept_clusters.json` chunk_ids = Qdrant point IDs),
+   compute normalised mean centroid via numpy.
 
-2. **Cosine score novelty** — add LLM judgment on score distance (described above).
+2. **Neighbor search** — query `chapters_dense` with the centroid vector (top 300 per
+   archetype). Returns semantically similar chunks not necessarily reached by the API's
+   named-entity index.
 
-3. **New archetype seeds** — edit `~/autoresearch/grand_bible/data/concepts.json` and
-   re-run the pipeline's step 12–14 to generate new entity clusters. Then resume here.
-   Note: this modifies the grand_bible pipeline — coordinate carefully.
+3. **Entity extraction** — regex-based proper-noun extraction from chunk text
+   (`extract_entities()` in prepare.py). Filters sentence starters, skip words.
+   Handles "And Noah" → "Noah" correctly.
 
-4. **Richer queries** — use variant groups and entity browse endpoints to explore
-   cross-tradition names for the same archetype figure (e.g. Noah/Utnapishtim/Manu/Ziusudra).
+4. **`unresearched_vectors` table** — stores (entity, chapter, archetype, affinity).
+   Loop processes them highest-affinity-first; marks each as `researched=1` after querying.
+
+5. **Seamless transition** — `run_loop()` handles both phases; Phase 2 has a more lenient
+   dry-streak threshold (20 vs 10) since sparse-tradition entities yield fewer API hits.
+
+**Qdrant snapshots** (taken before Phase 2 work began):
+- `grand_bible/data/snapshots/chapters_dense.snapshot` — 360 MB
+- `grand_bible/data/snapshots/chapters_colbert.snapshot` — 20 GB
+- Restore with `grand_bible/steps/import_qdrant.py`
+
+## Phase 3 Preview
+
+- **Cosine score novelty** — LLM or local model compares score distance of new observations
+  against existing DB entries; detects same entity in genuinely different semantic context.
+- **New archetype seeds** — edit `grand_bible/data/concepts.json`, re-run steps 12–14,
+  then resume loop. (Modifies grand_bible pipeline — coordinate carefully.)
+- **ColBERT reranking** — use `chapters_colbert` for more precise passage retrieval on
+  Phase 2 entity candidates before deciding whether to search the API.
 
 ---
 
