@@ -8,16 +8,31 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Claude Code session data (worktrees, session history — can be gigabytes)
+.claude/
+
+# Experiment outputs (regenerable)
 worktrees/
 results/
 queue/
+dev/
+results.tsv
+
+# Secrets and logs
+.env
+run.log
 
 # Agent prompt files (generated per-session by launchers)
-CLAUDE.md
 AGENTS.md
 
-# Experimental code/artifacts
-dev/
-
-# Results file
-results.tsv
+# Model checkpoints and large binary artifacts
+*.safetensors
+*.bin
+*.pt
+*.ckpt
+*.pkl
+output/
+checkpoints/
+lora_best/
+lora_weights/
