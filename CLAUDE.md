@@ -136,16 +136,9 @@ token directly when scripting pushes or API calls.
 
 ### gh CLI
 
-Installed at `/usr/bin/gh` (v2.4.0, Ubuntu package). **Not yet authenticated.**
+Installed at `/usr/bin/gh` (v2.4.0, Ubuntu package). **Authenticated as `jtatman`.**
 
-To authenticate:
-```bash
-gh auth login
-# choose: GitHub.com → HTTPS → browser or token
-```
-
-Once authenticated, `gh` handles push auth, PR creation, issue management, etc. without
-touching `.env` at all.
+`gh` handles push auth, PR creation, issue management, etc. without touching `.env` at all.
 
 Note: the Ubuntu package (v2.4.0, 2022) lags far behind upstream. If newer `gh` features
 are needed, install from https://github.com/cli/cli/releases or via the official apt source.
@@ -168,8 +161,10 @@ git push "https://jtatman:${GITHUB_TOKEN}@github.com/jtatman/autoresearch.git" <
 git remote set-url origin https://github.com/jtatman/autoresearch.git
 ```
 
-The `ANTHROPIC_API_KEY` (or similar) used by `train2.py` to pre-generate `<think>` blocks
-should also live in `.env` — add it before running Exp 2.
+**Anthropic API key:** Exp 2 requires Claude-generated `<think>` blocks as training data.
+These must be pre-generated via a separate script *before* running `train2.py` — the
+training script itself does not call the API. Add `ANTHROPIC_API_KEY` to `.env` and write
+the data-prep script as a prerequisite step before Exp 2 can run.
 
 ---
 
