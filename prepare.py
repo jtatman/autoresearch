@@ -1,389 +1,329 @@
 """
-One-time data preparation for autoresearch experiments.
-Downloads data shards and trains a BPE tokenizer.
+Grand Bible archetype research — infrastructure.
 
-Usage:
-    python prepare.py                  # full prep (download + tokenizer)
-    python prepare.py --num-shards 8   # download only 8 shards (for testing)
+Manages SQLite database, API calls, novelty detection, BFS query expansion,
+and the autonomous research loop.
 
-Data and tokenizer are stored in ~/.cache/autoresearch/.
+DO NOT MODIFY unless changing core infrastructure. Query parameters live in train.py.
 """
 
+import json
 import os
-import sys
+import sqlite3
 import time
-import math
-import argparse
-import pickle
-from multiprocessing import Pool
-
-import requests
-import pyarrow.parquet as pq
-import rustbpe
-import tiktoken
-import torch
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections import deque
 
 # ---------------------------------------------------------------------------
-# Constants (fixed, do not modify)
+# Config
 # ---------------------------------------------------------------------------
 
-MAX_SEQ_LEN = 2048       # context length
-TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
-EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
+API_BASE       = "http://localhost:8081"
+_HERE          = os.path.dirname(os.path.abspath(__file__))
+DB_PATH        = os.path.join(_HERE, "research.db")
+STATE_PATH     = os.path.join(_HERE, "loop_state.json")
+MAX_ITERATIONS = 1000
+LOOP_TIMEOUT   = 30.0   # seconds — single iteration wall clock limit
+DRY_STREAK_MAX = 10     # consecutive zero-new-info iterations before exit (a)
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Database
 # ---------------------------------------------------------------------------
 
-CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
-DATA_DIR = os.path.join(CACHE_DIR, "data")
-TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
-BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
-MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
-VAL_SHARD = MAX_SHARD  # pinned validation shard (shard_06542)
-VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
-VOCAB_SIZE = 8192
+def _db():
+    db = sqlite3.connect(DB_PATH)
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA synchronous=NORMAL")
+    db.execute("PRAGMA cache_size=-32000")   # 32 MB page cache
+    return db
 
-# BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
-SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
+def setup_db():
+    db = _db()
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS observations (
+            id           INTEGER PRIMARY KEY,
+            iteration    INTEGER NOT NULL,
+            endpoint     TEXT    NOT NULL,
+            query        TEXT    NOT NULL,
+            co_entity    TEXT    NOT NULL DEFAULT '',
+            concept      TEXT    NOT NULL DEFAULT '',
+            chapter      TEXT    NOT NULL DEFAULT '',
+            score        REAL,
+            passage      TEXT,
+            discovered_at REAL   NOT NULL
+        );
 
-SPECIAL_TOKENS = [f"<|reserved_{i}|>" for i in range(4)]
-BOS_TOKEN = "<|reserved_0|>"
+        -- Fast duplicate check: same query+co_entity+chapter is the same connection
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_connection
+            ON observations(query, co_entity, chapter);
+
+        CREATE INDEX IF NOT EXISTS idx_concept   ON observations(concept);
+        CREATE INDEX IF NOT EXISTS idx_co_entity ON observations(co_entity);
+
+        CREATE TABLE IF NOT EXISTS loop_runs (
+            id                INTEGER PRIMARY KEY,
+            started_at        REAL NOT NULL,
+            ended_at          REAL,
+            seed_query        TEXT,
+            total_iterations  INTEGER DEFAULT 0,
+            new_observations  INTEGER DEFAULT 0,
+            exit_reason       TEXT
+        );
+    """)
+    db.commit()
+    return db
 
 # ---------------------------------------------------------------------------
-# Data download
+# State
 # ---------------------------------------------------------------------------
 
-def download_single_shard(index):
-    """Download one parquet shard with retries. Returns True on success."""
-    filename = f"shard_{index:05d}.parquet"
-    filepath = os.path.join(DATA_DIR, filename)
-    if os.path.exists(filepath):
+def _load_state():
+    if os.path.exists(STATE_PATH):
+        with open(STATE_PATH) as f:
+            return json.load(f)
+    return {"iteration": 0, "queue": [], "seen": []}
+
+def _save_state(iteration, queue, seen):
+    with open(STATE_PATH, "w") as f:
+        json.dump({"iteration": iteration,
+                   "queue": list(queue),
+                   "seen": list(seen)}, f, indent=2)
+
+# ---------------------------------------------------------------------------
+# API
+# ---------------------------------------------------------------------------
+
+def _get(path, params=None):
+    url = API_BASE + path
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=LOOP_TIMEOUT - 2) as r:
+        return json.loads(r.read())
+
+def api_search(query, top_k=10):
+    return _get("/api/search", {"q": query, "top_k": top_k})
+
+def api_concepts():
+    return _get("/api/browse/concepts")
+
+# ---------------------------------------------------------------------------
+# Novelty
+#
+# Phase 1: pure set membership — (query, co_entity, chapter) not in DB → NEW.
+# Phase 2 hook: compare cosine scores of semantically similar observations;
+#   if new score differs by > threshold from existing, it's a different context.
+# ---------------------------------------------------------------------------
+
+def is_novel(db, query, co_entity, chapter):
+    row = db.execute(
+        "SELECT 1 FROM observations WHERE query=? AND co_entity=? AND chapter=?",
+        (query, co_entity, chapter)
+    ).fetchone()
+    return row is None
+
+def store(db, iteration, endpoint, query, co_entity, concept, chapter, score, passage):
+    try:
+        db.execute(
+            """INSERT INTO observations
+               (iteration, endpoint, query, co_entity, concept, chapter,
+                score, passage, discovered_at)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (iteration, endpoint, query, co_entity, concept, chapter,
+             score, (passage or "")[:600], time.time())
+        )
+        db.commit()
         return True
+    except sqlite3.IntegrityError:
+        return False
 
-    url = f"{BASE_URL}/{filename}"
-    max_attempts = 5
-    for attempt in range(1, max_attempts + 1):
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+
+def run_loop(endpoint, seed_query, top_k=10):
+    db      = setup_db()
+    state   = _load_state()
+
+    # Seed queue: initial query + all archetype seed queries.
+    # Queue entries are [query, concept_slug] pairs so archetype context
+    # propagates through BFS expansion.
+    if not state["queue"]:
         try:
-            response = requests.get(url, stream=True, timeout=30)
-            response.raise_for_status()
-            temp_path = filepath + ".tmp"
-            with open(temp_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-            os.rename(temp_path, filepath)
-            print(f"  Downloaded {filename}")
-            return True
-        except (requests.RequestException, IOError) as e:
-            print(f"  Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
-            for path in [filepath + ".tmp", filepath]:
-                if os.path.exists(path):
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
-            if attempt < max_attempts:
-                time.sleep(2 ** attempt)
-    return False
+            concepts_data = api_concepts()
+            seed_pairs    = [[seed_query, ""]]
+            for c in concepts_data:
+                slug = c.get("slug", "")
+                for q in c.get("queries", []):
+                    seed_pairs.append([q, slug])
+            print(f"Seeded queue with {len(seed_pairs)} queries from {len(concepts_data)} archetypes.")
+        except Exception as e:
+            print(f"Warning: could not fetch concepts for seeding: {e}")
+            seed_pairs = [[seed_query, ""]]
+        state["queue"] = seed_pairs
+        state["seen"]  = []
 
+    # Queue entries: [query_str, concept_slug]
+    queue      = deque(state["queue"])
+    seen       = set(state["seen"])
+    iteration  = state["iteration"]
+    dry_streak = 0
 
-def download_data(num_shards, download_workers=8):
-    """Download training shards + pinned validation shard."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    num_train = min(num_shards, MAX_SHARD)
-    ids = list(range(num_train))
-    if VAL_SHARD not in ids:
-        ids.append(VAL_SHARD)
+    db.execute("INSERT INTO loop_runs (started_at, seed_query) VALUES (?,?)",
+               (time.time(), seed_query))
+    db.commit()
+    run_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
 
-    # Count what's already downloaded
-    existing = sum(1 for i in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")))
-    if existing == len(ids):
-        print(f"Data: all {len(ids)} shards already downloaded at {DATA_DIR}")
-        return
+    new_total   = 0
+    exit_reason = None
 
-    needed = len(ids) - existing
-    print(f"Data: downloading {needed} shards ({existing} already exist)...")
+    print(f"\n{'='*60}")
+    print(f"Grand Bible Research Loop")
+    print(f"Endpoint: {endpoint} | Seed: {seed_query!r}")
+    print(f"Starting at iteration {iteration} | Queue depth: {len(queue)}")
+    print(f"{'='*60}\n")
 
-    workers = max(1, min(download_workers, needed))
-    with Pool(processes=workers) as pool:
-        results = pool.map(download_single_shard, ids)
+    while queue and iteration < MAX_ITERATIONS:
+        iteration += 1
+        t0 = time.time()
 
-    ok = sum(1 for r in results if r)
-    print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
+        entry         = queue.popleft()
+        current_query = entry[0] if isinstance(entry, list) else entry
+        parent_concept = entry[1] if isinstance(entry, list) and len(entry) > 1 else ""
 
-# ---------------------------------------------------------------------------
-# Tokenizer training
-# ---------------------------------------------------------------------------
+        if current_query in seen:
+            iteration -= 1   # don't count skipped queries
+            continue
+        seen.add(current_query)
 
-def list_parquet_files():
-    """Return sorted list of parquet file paths in the data directory."""
-    files = sorted(f for f in os.listdir(DATA_DIR) if f.endswith(".parquet") and not f.endswith(".tmp"))
-    return [os.path.join(DATA_DIR, f) for f in files]
+        print(f"[{iteration:04d}] q={current_query!r}", end="  ", flush=True)
 
+        # --- API call ---
+        try:
+            result = api_search(current_query, top_k=top_k)
+        except urllib.error.URLError as e:
+            elapsed = time.time() - t0
+            print(f"TIMEOUT/ERROR ({elapsed:.1f}s): {e}")
+            if elapsed >= LOOP_TIMEOUT:
+                exit_reason = f"timeout at iteration {iteration}: API call took {elapsed:.1f}s"
+                break
+            continue
+        except Exception as e:
+            print(f"ERROR: {e}")
+            continue
 
-def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
-    """Yield documents from training split (all shards except pinned val shard)."""
-    parquet_paths = [p for p in list_parquet_files() if not p.endswith(VAL_FILENAME)]
-    nchars = 0
-    for filepath in parquet_paths:
-        pf = pq.ParquetFile(filepath)
-        for rg_idx in range(pf.num_row_groups):
-            rg = pf.read_row_group(rg_idx)
-            for text in rg.column("text").to_pylist():
-                doc = text[:doc_cap] if len(text) > doc_cap else text
-                nchars += len(doc)
-                yield doc
-                if nchars >= max_chars:
-                    return
+        elapsed_api = time.time() - t0
 
+        passages    = result.get("top_passages", [])
+        cooccurring = result.get("cooccurring", [])
+        # Prefer concept from API result; fall back to parent archetype from seed
+        api_concepts_list = result.get("concepts", [])
+        concept = api_concepts_list[0] if api_concepts_list else parent_concept
 
-def train_tokenizer():
-    """Train BPE tokenizer using rustbpe, save as tiktoken pickle."""
-    tokenizer_pkl = os.path.join(TOKENIZER_DIR, "tokenizer.pkl")
-    token_bytes_path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
+        # --- Novelty check & store ---
+        new_this = 0
 
-    if os.path.exists(tokenizer_pkl) and os.path.exists(token_bytes_path):
-        print(f"Tokenizer: already trained at {TOKENIZER_DIR}")
-        return
+        if cooccurring:
+            for passage in passages[:3]:      # top 3 passages per query
+                chapter = passage.get("chapter", "")
+                score   = passage.get("score", 0.0)
+                text    = passage.get("text", "")
+                for co in cooccurring[:20]:   # top 20 co-occurring entities
+                    co_norm = co.get("norm", "")
+                    if is_novel(db, current_query, co_norm, chapter):
+                        if store(db, iteration, endpoint, current_query,
+                                 co_norm, concept, chapter, score, text):
+                            new_this += 1
+                            # BFS expansion: inherit parent concept when queuing co-entity
+                            if co_norm not in seen:
+                                queue.append([co_norm, concept])
+        else:
+            # No co-entities: store raw passage observations
+            for passage in passages:
+                chapter = passage.get("chapter", "")
+                score   = passage.get("score", 0.0)
+                text    = passage.get("text", "")
+                if is_novel(db, current_query, "", chapter):
+                    if store(db, iteration, endpoint, current_query,
+                             "", concept, chapter, score, text):
+                        new_this += 1
 
-    os.makedirs(TOKENIZER_DIR, exist_ok=True)
+        elapsed_total = time.time() - t0
+        new_total    += new_this
 
-    parquet_files = list_parquet_files()
-    if len(parquet_files) < 2:
-        print("Tokenizer: need at least 2 data shards (1 train + 1 val). Download more data first.")
-        sys.exit(1)
+        print(f"new={new_this:3d}  api={elapsed_api:.2f}s  total={elapsed_total:.2f}s")
 
-    # --- Train with rustbpe ---
-    print("Tokenizer: training BPE tokenizer...")
-    t0 = time.time()
+        # --- Exit condition b: iteration wall clock exceeded ---
+        if elapsed_total >= LOOP_TIMEOUT:
+            exit_reason = f"timeout at iteration {iteration} ({elapsed_total:.1f}s)"
+            break
 
-    tokenizer = rustbpe.Tokenizer()
-    vocab_size_no_special = VOCAB_SIZE - len(SPECIAL_TOKENS)
-    tokenizer.train_from_iterator(text_iterator(), vocab_size_no_special, pattern=SPLIT_PATTERN)
+        # --- Exit condition a: consecutive dry runs ---
+        if new_this == 0:
+            dry_streak += 1
+            if dry_streak >= DRY_STREAK_MAX:
+                exit_reason = (f"exhausted: {dry_streak} consecutive iterations "
+                               f"with no new observations")
+                break
+        else:
+            dry_streak = 0
 
-    # Build tiktoken encoding from trained merges
-    pattern = tokenizer.get_pattern()
-    mergeable_ranks = {bytes(k): v for k, v in tokenizer.get_mergeable_ranks()}
-    tokens_offset = len(mergeable_ranks)
-    special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
-    enc = tiktoken.Encoding(
-        name="rustbpe",
-        pat_str=pattern,
-        mergeable_ranks=mergeable_ranks,
-        special_tokens=special_tokens,
+        # Checkpoint state every 25 iterations
+        if iteration % 25 == 0:
+            _save_state(iteration, list(queue), list(seen))
+            print(f"  [checkpoint] iter={iteration} total_new={new_total} queue={len(queue)}")
+
+    # --- Wrap up ---
+    if not exit_reason:
+        if iteration >= MAX_ITERATIONS:
+            exit_reason = f"hard stop: reached {MAX_ITERATIONS} iterations"
+        else:
+            exit_reason = "queue exhausted"
+
+    db.execute(
+        "UPDATE loop_runs SET ended_at=?, total_iterations=?, new_observations=?, exit_reason=? WHERE id=?",
+        (time.time(), iteration, new_total, exit_reason, run_id)
     )
+    db.commit()
+    _save_state(iteration, queue, seen)
 
-    # Save tokenizer
-    with open(tokenizer_pkl, "wb") as f:
-        pickle.dump(enc, f)
+    print(f"\n{'='*60}")
+    print(f"Exit: {exit_reason}")
+    print(f"Iterations: {iteration} / {MAX_ITERATIONS}")
+    print(f"New observations: {new_total}")
+    total_in_db = db.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
+    print(f"Total in database: {total_in_db}")
+    print(f"{'='*60}\n")
 
-    t1 = time.time()
-    print(f"Tokenizer: trained in {t1 - t0:.1f}s, saved to {tokenizer_pkl}")
+    return exit_reason, iteration, new_total
 
-    # --- Build token_bytes lookup for BPB evaluation ---
-    print("Tokenizer: building token_bytes lookup...")
-    special_set = set(SPECIAL_TOKENS)
-    token_bytes_list = []
-    for token_id in range(enc.n_vocab):
-        token_str = enc.decode([token_id])
-        if token_str in special_set:
-            token_bytes_list.append(0)
-        else:
-            token_bytes_list.append(len(token_str.encode("utf-8")))
-    token_bytes_tensor = torch.tensor(token_bytes_list, dtype=torch.int32)
-    torch.save(token_bytes_tensor, token_bytes_path)
-    print(f"Tokenizer: saved token_bytes to {token_bytes_path}")
-
-    # Sanity check
-    test = "Hello world! Numbers: 123. Unicode: 你好"
-    encoded = enc.encode_ordinary(test)
-    decoded = enc.decode(encoded)
-    assert decoded == test, f"Tokenizer roundtrip failed: {test!r} -> {decoded!r}"
-    print(f"Tokenizer: sanity check passed (vocab_size={enc.n_vocab})")
 
 # ---------------------------------------------------------------------------
-# Runtime utilities (imported by train.py)
+# Summary query (for reporting)
 # ---------------------------------------------------------------------------
 
-class Tokenizer:
-    """Minimal tokenizer wrapper. Training is handled above."""
+def summarize(top_n=20):
+    db = _db()
+    print("\n--- Top co-entity connections by frequency ---")
+    rows = db.execute(
+        """SELECT co_entity, concept, COUNT(*) as n
+           FROM observations WHERE co_entity != ''
+           GROUP BY co_entity, concept
+           ORDER BY n DESC LIMIT ?""", (top_n,)
+    ).fetchall()
+    for co, concept, n in rows:
+        print(f"  {co:30s}  [{concept:25s}]  x{n}")
 
-    def __init__(self, enc):
-        self.enc = enc
-        self.bos_token_id = enc.encode_single_token(BOS_TOKEN)
+    print("\n--- Concepts by observation count ---")
+    rows = db.execute(
+        """SELECT concept, COUNT(*) as n FROM observations
+           WHERE concept != '' GROUP BY concept ORDER BY n DESC"""
+    ).fetchall()
+    for concept, n in rows:
+        print(f"  {concept:30s}  {n}")
 
-    @classmethod
-    def from_directory(cls, tokenizer_dir=TOKENIZER_DIR):
-        with open(os.path.join(tokenizer_dir, "tokenizer.pkl"), "rb") as f:
-            enc = pickle.load(f)
-        return cls(enc)
-
-    def get_vocab_size(self):
-        return self.enc.n_vocab
-
-    def get_bos_token_id(self):
-        return self.bos_token_id
-
-    def encode(self, text, prepend=None, num_threads=8):
-        if prepend is not None:
-            prepend_id = prepend if isinstance(prepend, int) else self.enc.encode_single_token(prepend)
-        if isinstance(text, str):
-            ids = self.enc.encode_ordinary(text)
-            if prepend is not None:
-                ids.insert(0, prepend_id)
-        elif isinstance(text, list):
-            ids = self.enc.encode_ordinary_batch(text, num_threads=num_threads)
-            if prepend is not None:
-                for row in ids:
-                    row.insert(0, prepend_id)
-        else:
-            raise ValueError(f"Invalid input type: {type(text)}")
-        return ids
-
-    def decode(self, ids):
-        return self.enc.decode(ids)
-
-
-def get_token_bytes(device="cpu"):
-    path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-    with open(path, "rb") as f:
-        return torch.load(f, map_location=device)
-
-
-def _document_batches(split, tokenizer_batch_size=128):
-    """Infinite iterator over document batches from parquet files."""
-    parquet_paths = list_parquet_files()
-    assert len(parquet_paths) > 0, "No parquet files found. Run prepare.py first."
-    val_path = os.path.join(DATA_DIR, VAL_FILENAME)
-    if split == "train":
-        parquet_paths = [p for p in parquet_paths if p != val_path]
-        assert len(parquet_paths) > 0, "No training shards found."
-    else:
-        parquet_paths = [val_path]
-    epoch = 1
-    while True:
-        for filepath in parquet_paths:
-            pf = pq.ParquetFile(filepath)
-            for rg_idx in range(pf.num_row_groups):
-                rg = pf.read_row_group(rg_idx)
-                batch = rg.column('text').to_pylist()
-                for i in range(0, len(batch), tokenizer_batch_size):
-                    yield batch[i:i+tokenizer_batch_size], epoch
-        epoch += 1
-
-
-def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
-    """
-    BOS-aligned dataloader with best-fit packing.
-    Every row starts with BOS. Documents packed using best-fit to minimize cropping.
-    When no document fits remaining space, crops shortest doc to fill exactly.
-    100% utilization (no padding).
-    """
-    assert split in ["train", "val"]
-    row_capacity = T + 1
-    batches = _document_batches(split)
-    bos_token = tokenizer.get_bos_token_id()
-    doc_buffer = []
-    epoch = 1
-
-    def refill_buffer():
-        nonlocal epoch
-        doc_batch, epoch = next(batches)
-        token_lists = tokenizer.encode(doc_batch, prepend=bos_token)
-        doc_buffer.extend(token_lists)
-
-    # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
-    row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
-    cpu_inputs = cpu_buffer[:B * T].view(B, T)
-    cpu_targets = cpu_buffer[B * T:].view(B, T)
-    inputs = gpu_buffer[:B * T].view(B, T)
-    targets = gpu_buffer[B * T:].view(B, T)
-
-    while True:
-        for row_idx in range(B):
-            pos = 0
-            while pos < row_capacity:
-                while len(doc_buffer) < buffer_size:
-                    refill_buffer()
-
-                remaining = row_capacity - pos
-
-                # Find largest doc that fits entirely
-                best_idx = -1
-                best_len = 0
-                for i, doc in enumerate(doc_buffer):
-                    doc_len = len(doc)
-                    if doc_len <= remaining and doc_len > best_len:
-                        best_idx = i
-                        best_len = doc_len
-
-                if best_idx >= 0:
-                    doc = doc_buffer.pop(best_idx)
-                    row_buffer[row_idx, pos:pos + len(doc)] = torch.tensor(doc, dtype=torch.long)
-                    pos += len(doc)
-                else:
-                    # No doc fits — crop shortest to fill remaining
-                    shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
-                    doc = doc_buffer.pop(shortest_idx)
-                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
-                    pos += remaining
-
-        cpu_inputs.copy_(row_buffer[:, :-1])
-        cpu_targets.copy_(row_buffer[:, 1:])
-        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
-        yield inputs, targets, epoch
-
-# ---------------------------------------------------------------------------
-# Evaluation (DO NOT CHANGE — this is the fixed metric)
-# ---------------------------------------------------------------------------
-
-@torch.no_grad()
-def evaluate_bpb(model, tokenizer, batch_size):
-    """
-    Bits per byte (BPB): vocab size-independent evaluation metric.
-    Sums per-token cross-entropy (in nats), sums target byte lengths,
-    then converts nats/byte to bits/byte. Special tokens (byte length 0)
-    are excluded from both sums.
-    Uses fixed MAX_SEQ_LEN so results are comparable across configs.
-    """
-    token_bytes = get_token_bytes(device="cuda")
-    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
-    steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
-    total_nats = 0.0
-    total_bytes = 0
-    for _ in range(steps):
-        x, y, _ = next(val_loader)
-        loss_flat = model(x, y, reduction='none').view(-1)
-        y_flat = y.view(-1)
-        nbytes = token_bytes[y_flat]
-        mask = nbytes > 0
-        total_nats += (loss_flat * mask).sum().item()
-        total_bytes += nbytes.sum().item()
-    return total_nats / (math.log(2) * total_bytes)
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch")
-    parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
-    parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
-    args = parser.parse_args()
-
-    num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
-
-    print(f"Cache directory: {CACHE_DIR}")
-    print()
-
-    # Step 1: Download data
-    download_data(num_shards, download_workers=args.download_workers)
-    print()
-
-    # Step 2: Train tokenizer
-    train_tokenizer()
-    print()
-    print("Done! Ready to train.")
+    summarize()
