@@ -129,6 +129,50 @@ LoRA best checkpoint: `~/.cache/smollm-xlam/best_lora/`
 
 ---
 
+## GitHub Authentication
+
+Two mechanisms are available. Prefer `gh` for interactive/ad-hoc operations; use the
+token directly when scripting pushes or API calls.
+
+### gh CLI
+
+Installed at `/usr/bin/gh` (v2.4.0, Ubuntu package). **Not yet authenticated.**
+
+To authenticate:
+```bash
+gh auth login
+# choose: GitHub.com → HTTPS → browser or token
+```
+
+Once authenticated, `gh` handles push auth, PR creation, issue management, etc. without
+touching `.env` at all.
+
+Note: the Ubuntu package (v2.4.0, 2022) lags far behind upstream. If newer `gh` features
+are needed, install from https://github.com/cli/cli/releases or via the official apt source.
+
+### API Tokens (`.env`)
+
+`.env` is gitignored. It holds three tokens:
+
+| Variable | Account | Purpose |
+|----------|---------|---------|
+| `GITHUB_TOKEN` | `jtatman` | Primary token for this repo (`jtatman/autoresearch`) |
+| `TATMANTECH_GITHUB_API_TOKEN` | `tatmantech` | Spare — retained for other repos/orgs |
+| `TATMANTECH_GITHUB_API_KEY2` | `tatmantech` | Spare — retained for other repos/orgs |
+
+To push via token without `gh`:
+```bash
+source .env
+git push "https://jtatman:${GITHUB_TOKEN}@github.com/jtatman/autoresearch.git" <branch>
+# reset remote URL afterward to avoid caching credentials in config
+git remote set-url origin https://github.com/jtatman/autoresearch.git
+```
+
+The `ANTHROPIC_API_KEY` (or similar) used by `train2.py` to pre-generate `<think>` blocks
+should also live in `.env` — add it before running Exp 2.
+
+---
+
 ## Known Issues & Constraints
 
 1. **Truncation ceiling:** 8/25 eval examples exceed 512 tokens. Their prompts are
