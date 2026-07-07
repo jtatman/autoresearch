@@ -106,7 +106,7 @@ loop_runs(id, started_at, ended_at, seed_query, total_iterations, new_observatio
 |------|-----------|
 | (a) | 10 consecutive iterations with zero new observations |
 | (b) | Single iteration exceeds 30 seconds wall clock |
-| (c) | ~~1,000 total iterations~~ — **removed; loop runs until natural exhaustion** |
+| (c) | No more cycle seeds — all co-entities have been queried (DB saturated) |
 
 ### Novelty Detection (Phase 1)
 
@@ -144,7 +144,7 @@ Between thematic runs, only `ENDPOINT` and `QUERY` change. The loop logic never 
 | test-2 | flood myth | killed (timeout 20s) | ~12 | ~510 | Post-fix, concepts correct |
 | run-1  | flood myth | queue exhausted (Phase 1) | 476 | 16,306 | Full Phase 1 BFS complete |
 | run-2  | flood myth | hard stop (MAX_ITERATIONS=1000) | 1000 | 34,205 | Phase 2 at 524/5554 (9.4%) when stopped |
-| run-3  | flood myth | pending | — | — | Continuing Phase 2; MAX_ITERATIONS removed |
+| run-3  | flood myth | fully exhausted | 6121 | 17,774 | Remainder pass (536 vectors) + Phase 1 cycling added; DB saturated at 208,512 obs |
 
 Delete `research.db` and `loop_state.json` to start fresh. Both gitignored.
 
@@ -193,6 +193,24 @@ When Phase 1 BFS exhausts, `run_loop()` automatically transitions to Phase 2:
 - `grand_bible/data/snapshots/chapters_dense.snapshot` — 360 MB
 - `grand_bible/data/snapshots/chapters_colbert.snapshot` — 20 GB
 - Restore with `grand_bible/steps/import_qdrant.py`
+
+## Phase 1 Cycling (implemented)
+
+After Phase 2 fully exhausts, `run_loop()` automatically seeds a new Phase 1 BFS cycle
+from the top 200 co-entities in the observations table that have never been used as queries
+themselves — the richest unexplored nodes in the co-occurrence graph.
+
+- `_get_cycle_seeds(db, n=200)` — selects top unqueried co-entities (length ≥ 3, excludes blanks)
+- `seen` is pre-seeded from all past `query` values so BFS doesn't redundantly re-query
+  already-exhausted entities; new seeds are explicitly excluded from `seen`
+- Dry streaks clear the queue (rather than breaking) so they also trigger the cycling check
+- Loop terminates only when `_get_cycle_seeds` returns empty — meaning every co-entity of
+  sufficient length has been queried at least once
+
+**Current state:** DB saturated at 208,512 observations across all 20 archetypes.
+All 5,554 Phase 2 vectors researched. All co-entities queried. Fully exhausted.
+
+---
 
 ## Phase 3 Preview
 

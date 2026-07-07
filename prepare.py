@@ -372,7 +372,23 @@ def store(db, iteration, endpoint, query, co_entity, concept, chapter, score, pa
         return False
 
 # ---------------------------------------------------------------------------
-# Main loop  (Phase 1: BFS → Phase 2: centroid burndown, seamlessly)
+# Cycle seeds: co-entities seen often but never queried — richest unexplored nodes
+# ---------------------------------------------------------------------------
+
+def _get_cycle_seeds(db, n=200):
+    rows = db.execute("""
+        SELECT co_entity, COUNT(*) AS freq
+        FROM observations
+        WHERE length(co_entity) >= 3
+          AND co_entity NOT IN (SELECT DISTINCT query FROM observations)
+        GROUP BY co_entity
+        ORDER BY freq DESC
+        LIMIT ?
+    """, (n,)).fetchall()
+    return [r[0] for r in rows]
+
+# ---------------------------------------------------------------------------
+# Main loop  (Phase 1: BFS → Phase 2: centroid burndown → Phase 1 cycle N …)
 # ---------------------------------------------------------------------------
 
 def run_loop(endpoint, seed_query, top_k=10):
@@ -400,6 +416,7 @@ def run_loop(endpoint, seed_query, top_k=10):
     iteration  = state["iteration"]
     dry_streak = 0
     phase      = 1 if not state.get("phase2_populated") else 2
+    cycle      = state.get("cycle", 1)
 
     db.execute("INSERT INTO loop_runs (started_at, seed_query) VALUES (?,?)",
                (time.time(), seed_query))
@@ -456,7 +473,28 @@ def run_loop(endpoint, seed_query, top_k=10):
                     print(f"\n  Phase 2 remainder pass: {len(fresh)} more entities loaded.")
                     dry_streak = 0
                     continue
-                break   # genuinely exhausted
+
+                # Phase 2 truly done — seed next Phase 1 cycle from top discoveries
+                seeds = _get_cycle_seeds(db, n=200)
+                if seeds:
+                    cycle += 1
+                    state["cycle"] = cycle
+                    # Pre-seed seen from all past queries so BFS doesn't re-query
+                    # already-exhausted entities; seeds excluded so they get processed
+                    past = {r[0] for r in db.execute(
+                        "SELECT DISTINCT query FROM observations"
+                    ).fetchall()}
+                    seen = past - set(seeds)
+                    for entity in seeds:
+                        queue.append([entity, f"cycle{cycle}"])
+                    phase = 1
+                    dry_streak = 0
+                    print(f"\n{'─'*60}")
+                    print(f"Phase 2 exhausted. Phase 1 cycle {cycle}: {len(seeds)} new seeds.")
+                    print(f"{'─'*60}\n")
+                    continue
+
+                break   # no unqueried co-entities remain — genuinely done
 
         # ---- Dequeue ----
         iteration += 1
@@ -471,7 +509,7 @@ def run_loop(endpoint, seed_query, top_k=10):
             continue
         seen.add(current_query)
 
-        tag = "P2" if phase == 2 else "P1"
+        tag = "P2" if phase == 2 else f"P1C{cycle}"
         print(f"[{iteration:04d}/{tag}] q={current_query!r}", end="  ", flush=True)
 
         # ---- API call ----
@@ -544,9 +582,9 @@ def run_loop(endpoint, seed_query, top_k=10):
         if new_this == 0:
             dry_streak += 1
             if dry_streak >= streak_limit:
-                exit_reason = (f"exhausted (Phase {phase}): "
-                               f"{dry_streak} consecutive dry iterations")
-                break
+                print(f"\n  Dry streak ({dry_streak}) — clearing queue to check for next cycle.")
+                queue.clear()   # triggers `not queue` cycling check on next iteration
+                dry_streak = 0
         else:
             dry_streak = 0
 
@@ -563,7 +601,8 @@ def run_loop(endpoint, seed_query, top_k=10):
 
     # ---- Wrap up ----
     if not exit_reason:
-        exit_reason = f"queue exhausted (Phase {phase})"
+        phase_tag = "2" if state.get("phase2_populated") and phase == 2 else f"1 cycle {cycle}"
+        exit_reason = f"fully exhausted (Phase {phase_tag} — no seeds remaining)"
 
     db.execute(
         "UPDATE loop_runs SET ended_at=?, total_iterations=?, "
