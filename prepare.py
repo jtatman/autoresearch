@@ -8,6 +8,7 @@ DO NOT MODIFY unless changing core infrastructure. Query parameters live in trai
 """
 
 import json
+import math
 import os
 import re
 import sqlite3
@@ -15,7 +16,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections import deque
+from collections import deque, defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -99,6 +100,22 @@ def setup_db():
             new_observations INTEGER DEFAULT 0,
             exit_reason      TEXT
         );
+
+        -- Phase 3: candidate entities for new archetypes
+        CREATE TABLE IF NOT EXISTS archetype_candidates (
+            id                  INTEGER PRIMARY KEY,
+            entity              TEXT    NOT NULL UNIQUE,
+            chunk_count         INTEGER NOT NULL,
+            intra_spread        REAL    NOT NULL,
+            min_archetype_dist  REAL    NOT NULL,
+            nearest_archetype   TEXT    NOT NULL,
+            concept_spread      INTEGER NOT NULL,
+            score               REAL    NOT NULL,
+            centroid            TEXT    NOT NULL,
+            chapters            TEXT    NOT NULL,
+            computed_at         REAL    NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_ac_score ON archetype_candidates(score DESC);
     """)
     db.commit()
     return db
@@ -230,6 +247,235 @@ def extract_entities(text):
             continue
         found.add(phrase.lower())
     return found
+
+# ---------------------------------------------------------------------------
+# Shared: archetype centroid computation (used by Phase 2 and Phase 3)
+# ---------------------------------------------------------------------------
+
+def _archetype_centroids():
+    """Return {slug: normalized np.array(384)} for all archetypes in concept_clusters.json."""
+    if not CONCEPT_CLUSTERS.exists():
+        return {}
+    with open(CONCEPT_CLUSTERS) as f:
+        clusters = json.load(f)
+    centroids = {}
+    for archetype in clusters:
+        slug     = archetype['slug']
+        by_ch    = archetype.get('by_chapter', {})
+        chunk_ids = [
+            p['chunk_id']
+            for passages in by_ch.values()
+            for p in passages
+            if p.get('chunk_id')
+        ]
+        if not chunk_ids:
+            continue
+        try:
+            vecs = qdrant_fetch_vectors(chunk_ids)
+        except Exception:
+            continue
+        if not vecs:
+            continue
+        arr = np.array(vecs, dtype=np.float32)
+        c   = arr.mean(axis=0)
+        n   = np.linalg.norm(c)
+        if n > 0:
+            c /= n
+        centroids[slug] = c
+    return centroids
+
+def _qdrant_fetch_id_map(point_ids):
+    """Return {int_id: list[float]} for a list of Qdrant point IDs (TEXT or int)."""
+    id_map  = {}
+    int_ids = [int(pid) for pid in point_ids]
+    for i in range(0, len(int_ids), QDRANT_BATCH):
+        batch = int_ids[i:i + QDRANT_BATCH]
+        try:
+            result = _qdrant_post(
+                f"/collections/{QDRANT_COLLECTION}/points",
+                {"ids": batch, "with_vector": True, "with_payload": False}
+            )
+        except Exception:
+            continue
+        for pt in result.get("result", []):
+            pid = pt.get("id")
+            v   = pt.get("vector")
+            if pid is not None and v:
+                id_map[int(pid)] = v
+    return id_map
+
+def _intra_spread(vecs):
+    """Mean pairwise cosine distance across a set of vectors (0=identical, 1=orthogonal)."""
+    if len(vecs) < 2:
+        return 0.0
+    A     = np.array(vecs, dtype=np.float32)
+    norms = np.linalg.norm(A, axis=1, keepdims=True)
+    A     = A / np.where(norms > 0, norms, 1.0)
+    G     = A @ A.T          # cosine similarities
+    n     = len(vecs)
+    i, j  = np.triu_indices(n, k=1)
+    return float(1.0 - G[i, j].mean())
+
+# ---------------------------------------------------------------------------
+# Phase 3: archetype candidate scoring
+# ---------------------------------------------------------------------------
+
+def run_phase3(db):
+    """
+    Score every entity in unresearched_vectors for archetype novelty.
+
+    Each entity has exactly one Qdrant chunk vector (UNIQUE entity/chapter
+    constraint means one row per entity). Spread is therefore measured via
+    concept_spread — how many distinct archetypes the entity appeared under
+    in observations — rather than pairwise vector distance.
+
+      score = min_archetype_dist * log1p(concept_spread) * log1p(obs_freq)
+
+    - min_archetype_dist : cosine distance from entity's chunk vector to the
+                           nearest existing archetype centroid (high = novel
+                           embedding region not covered by any archetype)
+    - concept_spread     : distinct archetypes entity appeared under in API
+                           results (high = entity bridges multiple traditions)
+    - obs_freq           : total observations featuring this entity (high =
+                           significant, not a hapax legomenon)
+
+    Results stored in archetype_candidates; top 30 printed.
+    """
+    print(f"\n{'='*60}")
+    print("Phase 3: archetype candidate scoring")
+    print(f"{'='*60}")
+
+    # All entities with a chunk_id
+    rows = db.execute("""
+        SELECT entity, chunk_id, chapter
+        FROM unresearched_vectors
+        WHERE chunk_id IS NOT NULL
+    """).fetchall()
+    print(f"  Entities with chunk vectors: {len(rows)}")
+
+    if not rows:
+        print("  No entities with chunk_ids — Phase 3 cannot run.")
+        return
+
+    # Concept spread = distinct archetypes under which THIS entity was discovered
+    # as a co-occurrence partner (co_entity column) — richer than query-side count
+    # because Phase 2 entities were each queried once under a single archetype context.
+    obs_stats = {}   # entity → (concept_spread, obs_freq)
+    for entity, n_concepts, freq in db.execute("""
+        SELECT co_entity, COUNT(DISTINCT concept), COUNT(*)
+        FROM observations
+        WHERE co_entity != '' AND concept != ''
+        GROUP BY co_entity
+    """).fetchall():
+        obs_stats[entity] = (n_concepts, freq)
+
+    # Batch-fetch all chunk vectors at once (id_map: int → vector)
+    all_chunk_ids = [r[1] for r in rows]
+    print(f"  Fetching {len(all_chunk_ids)} vectors from Qdrant …")
+    id_map = _qdrant_fetch_id_map(all_chunk_ids)
+    print(f"  Received {len(id_map)} vectors")
+
+    # Compute existing archetype centroids
+    print("  Computing archetype centroids …")
+    arch_centroids = _archetype_centroids()
+    print(f"  Loaded {len(arch_centroids)} archetype centroids")
+    if not arch_centroids:
+        print("  ERROR: could not load archetype centroids — aborting Phase 3.")
+        return
+
+    # Stack archetype centroids for vectorised distance computation
+    arch_slugs  = list(arch_centroids.keys())
+    arch_matrix = np.array([arch_centroids[s] for s in arch_slugs], dtype=np.float32)
+
+    # Build entity vectors matrix for bulk distance computation
+    valid_entities = []
+    valid_vectors  = []
+    entity_chapters = {}
+    for entity, chunk_id, chapter in rows:
+        cid_int = int(chunk_id)
+        if cid_int not in id_map:
+            continue
+        valid_entities.append(entity)
+        valid_vectors.append(id_map[cid_int])
+        entity_chapters[entity] = chapter
+
+    if not valid_entities:
+        print("  No vectors returned from Qdrant — aborting Phase 3.")
+        return
+
+    E = np.array(valid_vectors, dtype=np.float32)
+    # Normalise each entity vector
+    norms = np.linalg.norm(E, axis=1, keepdims=True)
+    E = E / np.where(norms > 0, norms, 1.0)
+
+    # Distances to all archetypes: (N_entities, N_archetypes)
+    sims  = E @ arch_matrix.T
+    dists = 1.0 - sims
+    min_dists   = dists.min(axis=1)
+    nearest_idx = dists.argmin(axis=1)
+
+    print(f"  Scoring {len(valid_entities)} entities …")
+    results = []
+    for i, entity in enumerate(valid_entities):
+        min_dist = float(min_dists[i])
+        nearest  = arch_slugs[int(nearest_idx[i])]
+        concept_spread, obs_freq = obs_stats.get(entity, (1, 1))
+        score    = min_dist * math.log1p(concept_spread) * math.log1p(obs_freq)
+
+        results.append({
+            "entity":             entity,
+            "chunk_count":        1,
+            "intra_spread":       float(concept_spread),   # repurposed field
+            "min_archetype_dist": round(min_dist, 4),
+            "nearest_archetype":  nearest,
+            "concept_spread":     concept_spread,
+            "score":              round(score, 5),
+            "centroid":           E[i].tolist(),
+            "chapters":           [entity_chapters[entity]],
+        })
+
+    results.sort(key=lambda r: r["score"], reverse=True)
+
+    # Persist all results
+    now = time.time()
+    db.execute("DELETE FROM archetype_candidates")   # replace any prior run
+    for r in results:
+        try:
+            db.execute("""
+                INSERT INTO archetype_candidates
+                (entity, chunk_count, intra_spread, min_archetype_dist,
+                 nearest_archetype, concept_spread, score,
+                 centroid, chapters, computed_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?)
+            """, (
+                r["entity"], r["chunk_count"], r["intra_spread"],
+                r["min_archetype_dist"], r["nearest_archetype"],
+                r["concept_spread"], r["score"],
+                json.dumps(r["centroid"]), json.dumps(r["chapters"]), now
+            ))
+        except sqlite3.Error:
+            pass
+    db.commit()
+
+    # Print top 30
+    top = results[:30]
+    print(f"\n  {'ENTITY':<28} {'SCORE':>8}  {'C.SPREAD':>8}  "
+          f"{'DIST':>7}  {'NEAREST ARCH':<25}  {'OBS':>6}  CHAPTER")
+    print(f"  {'─'*28} {'─'*8}  {'─'*8}  {'─'*7}  {'─'*25}  {'─'*6}  {'─'*25}")
+    for r in top:
+        _, obs_freq = obs_stats.get(r["entity"], (1, 1))
+        print(f"  {r['entity']:<28} {r['score']:>8.4f}  "
+              f"{r['concept_spread']:>8}  {r['min_archetype_dist']:>7.4f}  "
+              f"{r['nearest_archetype']:<25}  {obs_freq:>6}  "
+              f"{r['chapters'][0] if r['chapters'] else ''}")
+
+    print(f"\n  Phase 3 complete. {len(results)} candidates in archetype_candidates.")
+    if results:
+        t = results[0]
+        _, obs_freq = obs_stats.get(t["entity"], (1, 1))
+        print(f"  Top: '{t['entity']}' "
+              f"score={t['score']:.4f}  dist={t['min_archetype_dist']:.4f}  "
+              f"concept_spread={t['concept_spread']}  obs={obs_freq}")
 
 # ---------------------------------------------------------------------------
 # Phase 2: populate unresearched_vectors via centroid search
@@ -416,7 +662,7 @@ def run_loop(endpoint, seed_query, top_k=10):
     iteration  = state["iteration"]
     dry_streak = 0
     phase      = 1 if not state.get("phase2_populated") else 2
-    cycle      = state.get("cycle", 1)
+    cycle      = state.get("cycle") or 1   # guard against None saved from old state
 
     db.execute("INSERT INTO loop_runs (started_at, seed_query) VALUES (?,?)",
                (time.time(), seed_query))
@@ -600,6 +846,7 @@ def run_loop(endpoint, seed_query, top_k=10):
                   f"queue={len(queue)} p2_pending={pending_p2}")
 
     # ---- Wrap up ----
+    fully_exhausted = not exit_reason   # will be set below; capture before overwrite
     if not exit_reason:
         phase_tag = "2" if state.get("phase2_populated") and phase == 2 else f"1 cycle {cycle}"
         exit_reason = f"fully exhausted (Phase {phase_tag} — no seeds remaining)"
@@ -626,6 +873,12 @@ def run_loop(endpoint, seed_query, top_k=10):
     print(f"Total observations in DB: {obs_total}")
     print(f"Unresearched vectors: {uv_done}/{uv_total} researched")
     print(f"{'='*60}\n")
+
+    # Phase 3 runs once, on true exhaustion, if not already done
+    if fully_exhausted and not state.get("phase3_done"):
+        run_phase3(db)
+        state["phase3_done"] = True
+        _save_state(state)
 
     return exit_reason, iteration, new_total
 

@@ -194,6 +194,45 @@ When Phase 1 BFS exhausts, `run_loop()` automatically transitions to Phase 2:
 - `grand_bible/data/snapshots/chapters_colbert.snapshot` — 20 GB
 - Restore with `grand_bible/steps/import_qdrant.py`
 
+## Phase 3: Archetype Candidate Scoring (implemented)
+
+Runs automatically once after full exhaustion. Scores every entity in
+`unresearched_vectors` against the existing 20 archetype centroids.
+
+**Score formula:** `min_archetype_dist × log1p(concept_spread) × log1p(obs_freq)`
+- `min_archetype_dist` — cosine distance from entity's chunk vector to nearest archetype centroid (high = novel embedding region)
+- `concept_spread` — distinct archetypes entity appeared under as a co-occurrence partner in Phase 1/2 (from `observations.co_entity`)
+- `obs_freq` — total times entity appeared as co-occurrence (significance weight)
+
+Results stored in `archetype_candidates` table (5,554 candidates scored).
+
+**Top candidates from run-1:**
+
+| Entity | Score | C.Spread | Dist | Nearest Arch |
+|--------|-------|----------|------|--------------|
+| minerva | 3.75 | 17 | 0.306 | cosmic_tree |
+| olympus | 2.48 | 11 | 0.262 | solar_deity |
+| joshua | 2.46 | 9 | 0.285 | sacred_covenant |
+| athene | 2.39 | 10 | 0.281 | trickster |
+| aquila | 2.24 | 8 | 0.302 | virgin_birth |
+| ziusudra | 2.16 | 6 | 0.336 | flood_myth |
+| uriel | 2.06 | 9 | 0.248 | seven_heavens |
+| ravana | 1.99 | 12 | 0.202 | solar_deity |
+| isis | 1.55 | 6 | 0.270 | trickster |
+| mani | 1.46 | 5 | 0.308 | sacred_fire |
+| buddha | 1.35 | 5 | 0.262 | solar_deity |
+
+**Interpretation:** High-scoring candidates with high `dist` and `concept_spread`
+are the best new archetype prospects. Entities like `minerva` (dist=0.31,
+spread=17) and `mani` (Manichaeism founder, dist=0.31, spread=5) appear in
+genuinely novel embedding regions. `mainaka` (mountain that rose from the sea
+for Hanuman — world_mountain territory) and `ravana` (multi-tradition demon
+king) bridge multiple archetype contexts.
+
+Before adding any as a new archetype: verify the candidate's Qdrant centroid
+is meaningfully distant from ALL 20 existing centroids (not just the nearest),
+and that it has representable seed chunks across ≥3 traditions.
+
 ## Phase 1 Cycling (implemented)
 
 After Phase 2 fully exhausts, `run_loop()` automatically seeds a new Phase 1 BFS cycle
