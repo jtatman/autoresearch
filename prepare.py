@@ -77,7 +77,7 @@ def setup_db():
             id         INTEGER PRIMARY KEY,
             entity     TEXT    NOT NULL,
             chapter    TEXT    NOT NULL DEFAULT '',
-            chunk_id   INTEGER,
+            chunk_id   TEXT,
             archetype  TEXT    NOT NULL DEFAULT '',
             affinity   REAL,
             passage    TEXT,
@@ -329,8 +329,8 @@ def populate_unresearched(db):
                            (entity, chapter, chunk_id, archetype, affinity,
                             passage, added_at)
                            VALUES (?,?,?,?,?,?,?)""",
-                        (entity, chapter, chunk_id, slug, affinity,
-                         text[:400], time.time())
+                        (entity, chapter, str(chunk_id) if chunk_id else None,
+                         slug, affinity, text[:400], time.time())
                     )
                     if db.execute("SELECT changes()").fetchone()[0]:
                         new_entities += 1
