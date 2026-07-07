@@ -33,7 +33,7 @@ _HERE          = os.path.dirname(os.path.abspath(__file__))
 DB_PATH        = os.path.join(_HERE, "research.db")
 STATE_PATH     = os.path.join(_HERE, "loop_state.json")
 
-MAX_ITERATIONS    = 1000
+MAX_ITERATIONS    = None  # no hard cap — exit via dry streak or queue exhaustion
 LOOP_TIMEOUT      = 30.0   # seconds — single iteration wall clock limit
 DRY_STREAK_MAX    = 10     # consecutive zero-new-info iterations before exit (a)
 DRY_STREAK_P2     = 20     # more lenient threshold for Phase 2 (sparse entities)
@@ -415,7 +415,7 @@ def run_loop(endpoint, seed_query, top_k=10):
     print(f"Iteration: {iteration} | Queue: {len(queue)}")
     print(f"{'='*60}\n")
 
-    while iteration < MAX_ITERATIONS:
+    while True:
 
         # ---- Phase transition: BFS exhausted → populate centroid seeds ----
         if not queue:
@@ -550,10 +550,7 @@ def run_loop(endpoint, seed_query, top_k=10):
 
     # ---- Wrap up ----
     if not exit_reason:
-        if iteration >= MAX_ITERATIONS:
-            exit_reason = f"hard stop: reached {MAX_ITERATIONS} iterations"
-        else:
-            exit_reason = f"queue exhausted (Phase {phase})"
+        exit_reason = f"queue exhausted (Phase {phase})"
 
     db.execute(
         "UPDATE loop_runs SET ended_at=?, total_iterations=?, "
@@ -567,7 +564,7 @@ def run_loop(endpoint, seed_query, top_k=10):
 
     print(f"\n{'='*60}")
     print(f"Exit: {exit_reason}")
-    print(f"Iterations: {iteration} / {MAX_ITERATIONS}")
+    print(f"Iterations: {iteration}")
     print(f"New observations: {new_total}")
     obs_total = db.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
     uv_done   = db.execute(

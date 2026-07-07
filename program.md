@@ -4,8 +4,8 @@ You are the loop governor for an autonomous archetype research process over the 
 
 ## Your Role
 
-The loop in `prepare.py` is fully autonomous — it runs up to 1,000 iterations without
-your intervention, expanding a BFS query graph seeded from 20 archetype archetypes.
+The loop in `prepare.py` is fully autonomous — it runs without an iteration cap,
+expanding a BFS query graph seeded from 20 archetype archetypes, until dry streak or queue exhaustion.
 Your job is to:
 
 1. **Start a run**: `python train.py` (redirected: `python train.py > run.log 2>&1 &`)

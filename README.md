@@ -10,7 +10,7 @@ building a growing graph of cross-tradition connections with each iteration.
 ## Quick Start
 
 ```bash
-# Run the research loop (up to 1000 iterations, auto-exits on exhaustion or timeout)
+# Run the research loop (auto-exits on dry streak, timeout, or queue exhaustion)
 python train.py
 
 # Summarize what's been found so far
@@ -40,4 +40,4 @@ Qdrant running locally on Docker (port 6333). REST API on `http://localhost:8081
 |-----------|---------|
 | (a) Exhausted | 10 consecutive iterations with zero new observations |
 | (b) Timeout | Any single iteration exceeds 30 seconds |
-| (c) Hard stop | 1,000 total iterations reached |
+| (c) Queue empty | All Phase 2 unresearched vectors processed |

@@ -106,7 +106,7 @@ loop_runs(id, started_at, ended_at, seed_query, total_iterations, new_observatio
 |------|-----------|
 | (a) | 10 consecutive iterations with zero new observations |
 | (b) | Single iteration exceeds 30 seconds wall clock |
-| (c) | 1,000 total iterations reached |
+| (c) | ~~1,000 total iterations~~ — **removed; loop runs until natural exhaustion** |
 
 ### Novelty Detection (Phase 1)
 
@@ -143,7 +143,8 @@ Between thematic runs, only `ENDPOINT` and `QUERY` change. The loop logic never 
 | test-1 | flood myth | killed (head pipe) | ~50 | ~2,100 | Pre-fix, concept field blank |
 | test-2 | flood myth | killed (timeout 20s) | ~12 | ~510 | Post-fix, concepts correct |
 | run-1  | flood myth | queue exhausted (Phase 1) | 476 | 16,306 | Full Phase 1 BFS complete |
-| run-2  | flood myth | pending | — | — | Phase 1 + Phase 2 centroid burndown |
+| run-2  | flood myth | hard stop (MAX_ITERATIONS=1000) | 1000 | 34,205 | Phase 2 at 524/5554 (9.4%) when stopped |
+| run-3  | flood myth | pending | — | — | Continuing Phase 2; MAX_ITERATIONS removed |
 
 Delete `research.db` and `loop_state.json` to start fresh. Both gitignored.
 
