@@ -443,7 +443,20 @@ def run_loop(endpoint, seed_query, top_k=10):
                 continue   # re-enter loop with Phase 2 queue
 
             else:
-                break   # both phases done
+                # Phase 2 queue drained — check for unprocessed remainder
+                # (LIMIT on initial load may have left low-affinity rows behind)
+                rows = db.execute(
+                    """SELECT entity, archetype FROM unresearched_vectors
+                       WHERE researched=0 ORDER BY affinity DESC"""
+                ).fetchall()
+                fresh = [[e, a] for e, a in rows if e not in seen]
+                if fresh:
+                    for entry in fresh:
+                        queue.append(entry)
+                    print(f"\n  Phase 2 remainder pass: {len(fresh)} more entities loaded.")
+                    dry_streak = 0
+                    continue
+                break   # genuinely exhausted
 
         # ---- Dequeue ----
         iteration += 1
