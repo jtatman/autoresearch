@@ -49,13 +49,17 @@ Hi have a look at program.md and let's kick off a new experiment! let's do the s
 
 The `program.md` file is essentially a super lightweight "skill".
 
-## Project structure
+## Architecture
 
 ```
-prepare.py      — constants, data prep + runtime utilities (do not modify)
-train.py        — model, optimizer, training loop (agent modifies this)
-program.md      — agent instructions
-pyproject.toml  — dependencies
+| File | Role |
+|------|------|
+| `train.py` | model, optimizer, training loop (agent modifies this) 
+| `prepare.py` | constants, data prep + runtime utilities (do not modify)
+| `loop_state.json` | iteration counter 
+| `CLAUDE.md` | Full project context and session restart guide. |
+| `program.md` | Loop instructions for the LLM governor (Claude). |
+
 ```
 
 ## Design choices
@@ -90,3 +94,5 @@ I think these would be the reasonable hyperparameters to play with. Ask your fav
 ## License
 
 MIT
+
+
