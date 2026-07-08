@@ -6,7 +6,6 @@ We're coming up with a novel loop project. This involves three phases: planning,
 
 ---
 
-
 ### The Great Beyond
 
 
