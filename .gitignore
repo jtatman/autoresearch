@@ -23,7 +23,8 @@ loop_state.json
 # Results file
 results.tsv
 
-# Direction runtime artifacts (generated, regenerable)
+# Direction runtime artifacts (generated/downloaded, regenerable)
 directions/*/data/
+directions/*/data_*/
 directions/*/best_model.pt
 directions/*/*.pt

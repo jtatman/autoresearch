@@ -1,21 +1,21 @@
 """
 Direction 4 — Adversarial Self-Labeling :: MUTABLE HALF (the attempt).
 
-Blow this away and rewrite it each iteration to improve HOW the loop labels and trains.
-It may use ONLY the immutable contract in prepare.py. The keep/revert signal is anchor
-accuracy from prepare.evaluate() — nothing else.
+B-generation: the discriminator is now a LEARNED, CO-EVOLVING adversary, not a fixed
+statistical critic. Each round it is trained to tell real (labeled-seed) box placements
+from corrupted ones, and — crucially — from the generator's own boundary proposals mined
+last round. A fixed critic gets gamed; this one keeps getting retrained on the generator's
+hardest cases, so it stays sharp as the generator improves. It remains NEGATIVE-ONLY at
+inference: it only vetoes, it never proposes a box.
 
 One round:
-  generate K label variants  ->  NEGATIVE-ONLY discriminator veto  ->  consensus filter
-    ->  augment survivors (counter attrition)  ->  fine-tune  ->  eval on anchor  ->  keep/revert
+  train D (real vs corrupted vs generator hard-negatives)
+    -> G proposes K variants -> D veto -> consensus -> augment survivors
+    -> fine-tune G -> eval on immutable anchor -> keep/revert
+    -> stash G's boundary proposals as next round's hard negatives (co-evolution)
 
-Design notes that came out of the philosophy:
-  * The critic never asserts where the box SHOULD be; it only rejects where it clearly
-    shouldn't. It can only shrink the acceptable set — never assert a specific wrong box.
-  * Rejection is severe (~coin-flip survival). Survivors are AUGMENTED so the trainable set
-    doesn't drain to nothing — approximation compensating for its own attrition.
-  * Trust is a survival rate, not truth. CONF_THRESHOLD is the "good enough" line; raise it
-    for purity at the cost of yield, lower it for yield at the cost of drift.
+The immutable anchor + drift guard remain the only truth signal and the only backstop
+against the two GAN failure modes (D too strong -> starvation; D too weak -> slop).
 """
 
 from __future__ import annotations
@@ -35,124 +35,178 @@ from prepare import (
 STATE_PATH = os.path.join(HERE, "loop_state.json")
 CKPT_PATH = os.path.join(HERE, "best_model.pt")
 
-DEVICE = "cpu"                 # tiny synthetic net; real scale would move to the GTX 1070 (fp32/fp16)
+DEVICE = "cpu"
 torch.manual_seed(0)
 np.random.seed(0)
 
-# --- tunable knobs (part of the mutable method) --------------------------------
-K_VARIANTS = 5                # label proposals per frame
-CONF_THRESHOLD = 0.55         # discriminator veto line (survive-better-than-coin-flip)
-AGREE_IOU = 0.55              # survivors must agree this much to form a consensus label
-AUG_PER_SAMPLE = 2            # augmented copies per accepted pseudo-label (attrition offset)
-FINETUNE_EPOCHS = 8
+# --- tunable knobs (mutable method) --------------------------------------------
+# Proposals come from MC-DROPOUT: K stochastic forward passes expose the model's own
+# uncertainty. Where it's confidently correct the boxes cluster; where it's guessing they
+# scatter. Agreement across samples is therefore a real reliability signal — the property
+# that timid jitter and photometric TTA both lacked (they produced false agreement).
+K_MC = 8                      # stochastic forward passes per frame
+DROPOUT = 0.3
+CONF_THRESHOLD = 0.4          # learned-D veto line (negative-only: reject clear-wrong)
+AGREE_IOU = 0.55
+AUG_PER_SAMPLE = 2
+G_EPOCHS = 8
+D_EPOCHS = 3                  # keep D from overpowering G (GAN balance)
+D_WEIGHT_DECAY = 1e-4
+POS_LABEL = 0.9               # label smoothing -> less overconfident D
+NEG_IOU_MAX = 0.3            # only CLEARLY-wrong boxes are negatives; the middle is left ambiguous
+HARD_NEG_CAP = 150
+FALSE_ACCEPT_PER_ROUND = 40  # bounded co-evolution intake (avoid cold-start poisoning)
 
 
 # ---------------------------------------------------------------------------
-# Model: a tiny CNN box regressor. (The LSTM half lands when frames become video;
-# synthetic frames are i.i.d., so temporal recurrence is a no-op here and omitted.)
+# Generator: tiny CNN box regressor (LSTM lands when frames become video)
 # ---------------------------------------------------------------------------
 
 class BoxCNN(nn.Module):
     def __init__(self):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(1, 8, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),   # 32 -> 16
-            nn.Conv2d(8, 16, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),  # 16 -> 8
-            nn.Flatten(), nn.Linear(16 * 8 * 8, 64), nn.ReLU(), nn.Linear(64, 4),
+            nn.Conv2d(1, 8, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(8, 16, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+            nn.AdaptiveMaxPool2d((8, 8)),                       # size-agnostic: 32px or 64px frames
+            nn.Flatten(), nn.Linear(16 * 8 * 8, 64), nn.ReLU(),
+            nn.Dropout(DROPOUT),                                # kept active at inference for MC sampling
+            nn.Linear(64, 4),
         )
 
     def forward(self, x):
-        return torch.sigmoid(self.net(x))   # normalized [x0, y0, x1, y1] in [0, 1]
+        return torch.sigmoid(self.net(x))
 
-    @torch.no_grad()
-    def predict(self, frame_2d):
-        x = torch.from_numpy(np.asarray(frame_2d, dtype=np.float32))[None, None].to(DEVICE)
-        n = self(x)[0].cpu().numpy()
-        b = (n * FRAME_HW).astype(np.int64)
+    def _to_box(self, n):
+        b = (n * FRAME_HW)
         x0, y0 = min(b[0], b[2]), min(b[1], b[3])
         x1, y1 = max(b[0], b[2]) + 1, max(b[1], b[3]) + 1
-        return np.array([x0, y0, x1, y1], dtype=np.int64)
+        b = np.array([x0, y0, x1, y1], dtype=np.int64)
+        b[:2] = np.clip(b[:2], 0, FRAME_HW - 2)
+        b[2:] = np.clip(b[2:], b[:2] + 1, FRAME_HW)
+        return b
+
+    def _forward_np(self, frame_2d):
+        x = torch.from_numpy(np.asarray(frame_2d, dtype=np.float32))[None, None].to(DEVICE)
+        return self(x)[0].cpu().numpy()
+
+    @torch.no_grad()
+    def predict(self, frame_2d):                                # deterministic (dropout off)
+        self.eval()
+        return self._to_box(self._forward_np(frame_2d))
+
+    @torch.no_grad()
+    def predict_mc(self, frame_2d, k):                          # stochastic (dropout on) -> uncertainty
+        self.train()
+        boxes = [self._to_box(self._forward_np(frame_2d)) for _ in range(k)]
+        self.eval()
+        return boxes
 
 
 # ---------------------------------------------------------------------------
-# Negative-only discriminator: learns "true patterns" from the labeled seed, then only
-# ever REJECTS candidates that violate them. Never proposes a box.
+# Learned discriminator: (frame, box-mask) -> plausibility. Real=1, corrupt=0.
 # ---------------------------------------------------------------------------
 
-class Critic:
-    def __init__(self, frames, boxes):
-        wh = boxes[:, 2:] - boxes[:, :2]
-        areas = wh[:, 0] * wh[:, 1]
-        aspect = wh[:, 0] / np.maximum(wh[:, 1], 1)
-        self.log_area_mu, self.log_area_sd = np.log(areas).mean(), np.log(areas).std() + 1e-6
-        self.aspect_mu, self.aspect_sd = aspect.mean(), aspect.std() + 1e-6
-        # typical interior-vs-exterior brightness margin of a true object
-        self.contrast_ref = np.mean([self._contrast(f, b) for f, b in zip(frames, boxes)])
+class Discriminator(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(2, 8, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(8, 16, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+            nn.AdaptiveMaxPool2d((8, 8)),                       # size-agnostic: 32px or 64px frames
+            nn.Flatten(), nn.Linear(16 * 8 * 8, 64), nn.ReLU(), nn.Linear(64, 1),
+        )
 
-    @staticmethod
-    def _contrast(frame, box):
-        x0, y0, x1, y1 = [int(v) for v in box]
-        x0, y0 = max(0, x0), max(0, y0)
-        x1, y1 = min(FRAME_HW, x1), min(FRAME_HW, y1)
-        if x1 <= x0 or y1 <= y0:
-            return -1.0
-        inside = frame[y0:y1, x0:x1].mean()
-        mask = np.ones_like(frame, dtype=bool)
-        mask[y0:y1, x0:x1] = False
-        outside = frame[mask].mean() if mask.any() else 0.0
-        return float(inside - outside)
+    def forward(self, x):
+        return torch.sigmoid(self.net(x)).squeeze(-1)
 
-    def score(self, frame, box):
-        """Plausibility in [0, 1]. LOW = reject. Product of soft memberships => any single
-        gross violation collapses the score (rejection dominates)."""
-        wh = np.array([box[2] - box[0], box[3] - box[1]], dtype=np.float64)
-        if wh[0] <= 0 or wh[1] <= 0:
-            return 0.0
-        area, aspect = wh[0] * wh[1], wh[0] / max(wh[1], 1)
-        s_area = np.exp(-0.5 * ((np.log(area) - self.log_area_mu) / self.log_area_sd) ** 2)
-        s_aspect = np.exp(-0.5 * ((aspect - self.aspect_mu) / self.aspect_sd) ** 2)
-        contrast = self._contrast(frame, box)
-        s_contrast = 1.0 / (1.0 + np.exp(-12.0 * (contrast - 0.5 * self.contrast_ref)))
-        return float(s_area * s_aspect * s_contrast)
+
+def _box_mask(box):
+    m = np.zeros((FRAME_HW, FRAME_HW), dtype=np.float32)
+    x0, y0, x1, y1 = [int(v) for v in box]
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(FRAME_HW, x1), min(FRAME_HW, y1)
+    if x1 > x0 and y1 > y0:
+        m[y0:y1, x0:x1] = 1.0
+    return m
+
+
+def _d_batch(pairs):
+    """pairs: list of (frame, box) -> tensor [N, 2, H, W]."""
+    arr = np.stack([np.stack([f, _box_mask(b)]) for f, b in pairs]).astype(np.float32)
+    return torch.from_numpy(arr).to(DEVICE)
+
+
+def _clearly_wrong(box, rng):
+    """A corruption that is CLEARLY wrong (IoU < NEG_IOU_MAX with the real box). The
+    ambiguous middle band is deliberately never labelled — D only learns to reject slop."""
+    for _ in range(8):
+        if rng.random() < 0.5:                                # random box
+            w, h = rng.integers(3, 16), rng.integers(3, 16)
+            x0, y0 = rng.integers(0, FRAME_HW - w), rng.integers(0, FRAME_HW - h)
+            cand = np.array([x0, y0, x0 + w, y0 + h], dtype=np.int64)
+        else:                                                 # heavy jitter
+            off = rng.integers(-10, 11, size=4)
+            cand = box + off
+            cand[:2] = np.clip(cand[:2], 0, FRAME_HW - 2)
+            cand[2:] = np.clip(cand[2:], cand[:2] + 1, FRAME_HW)
+            cand = cand.astype(np.int64)
+        if iou(cand, box) < NEG_IOU_MAX:
+            return cand
+    return cand
+
+
+def train_discriminator(D, lab_frames, lab_boxes, hard_negs, rng):
+    pos = list(zip(lab_frames, lab_boxes))
+    neg = [(f, _clearly_wrong(b, rng)) for f, b in pos]       # clearly-wrong synthetic negatives
+    neg += list(hard_negs)                                    # D's own false-accepts from last round
+    if len(neg) > len(pos):                                   # class balance -> D isn't reject-biased
+        idx = rng.choice(len(neg), size=len(pos), replace=False)
+        neg = [neg[i] for i in idx]
+    X = _d_batch(pos + neg)
+    y = torch.cat([torch.full((len(pos),), POS_LABEL), torch.zeros(len(neg))]).to(DEVICE)
+    opt = torch.optim.Adam(D.parameters(), lr=1e-3, weight_decay=D_WEIGHT_DECAY)
+    D.train()
+    for _ in range(D_EPOCHS):
+        opt.zero_grad()
+        loss = nn.functional.binary_cross_entropy(D(X), y)
+        loss.backward()
+        opt.step()
+    D.eval()
+    with torch.no_grad():
+        acc = ((D(X) > 0.5).float() == (y > 0.5).float()).float().mean().item()
+    return acc
+
+
+@torch.no_grad()
+def d_score(D, frame, box):
+    return float(D(_d_batch([(frame, box)]))[0].item())
 
 
 # ---------------------------------------------------------------------------
-# Generator + consensus: propose K jittered variants, keep those the critic doesn't veto,
-# accept only if survivors AGREE (consensus). Disagreement or empty => attrition.
+# Generator proposals + consensus, judged by the learned D
 # ---------------------------------------------------------------------------
 
-def _jitter(box, rng):
-    off = rng.integers(-3, 4, size=4)
-    b = box + off
-    b[:2] = np.clip(b[:2], 0, FRAME_HW - 2)
-    b[2:] = np.clip(b[2:], b[:2] + 1, FRAME_HW)
-    return b.astype(np.int64)
-
-
-def propose_and_filter(model, frame, critic, rng):
-    """Return (consensus_box or None, n_survived_veto)."""
-    seed = model.predict(frame)
-    variants = [seed] + [_jitter(seed, rng) for _ in range(K_VARIANTS - 1)]
-    survivors = [b for b in variants if critic.score(frame, b) >= CONF_THRESHOLD]
+def propose_and_filter(model, D, frame, rng):
+    """MC-dropout proposals: K stochastic samples expose model uncertainty. D vetoes
+    implausible ones; the survivors must then AGREE (low scatter) to be accepted. High
+    scatter => the model is guessing => reject (real attrition correlated with error).
+    Survivors that were let through but DISAGREE are D's false-accepts -> hard negatives."""
+    samples = model.predict_mc(frame, K_MC)
+    survivors = [b for b in samples if d_score(D, frame, b) >= CONF_THRESHOLD]
     if len(survivors) < 2:
-        return None, len(survivors)
-    # agreement: mean pairwise IoU of survivors
+        return None, survivors, len(survivors)
     ious = [iou(survivors[i], survivors[j]) for i in range(len(survivors)) for j in range(i + 1, len(survivors))]
-    if np.mean(ious) < AGREE_IOU:
-        return None, len(survivors)
-    consensus = np.stack(survivors).mean(0).astype(np.int64)
-    return consensus, len(survivors)
+    if np.mean(ious) < AGREE_IOU:                             # uncertain / let-through but unreliable
+        return None, survivors, len(survivors)
+    return np.stack(survivors).mean(0).astype(np.int64), survivors, len(survivors)
 
-
-# ---------------------------------------------------------------------------
-# Augmentation: bolster accepted pseudo-labels to offset rejection attrition.
-# ---------------------------------------------------------------------------
 
 def augment(frame, box, rng):
     out = [(frame, box)]
     for _ in range(AUG_PER_SAMPLE):
         f = np.clip(frame + rng.normal(0, 0.03, frame.shape).astype(np.float32), 0, 1)
-        if rng.random() < 0.5:  # horizontal flip (box x-coords mirror)
+        if rng.random() < 0.5:
             f = f[:, ::-1].copy()
             b = np.array([FRAME_HW - box[2], box[1], FRAME_HW - box[0], box[3]], dtype=np.int64)
         else:
@@ -161,16 +215,12 @@ def augment(frame, box, rng):
     return out
 
 
-# ---------------------------------------------------------------------------
-# Fine-tune on labeled seed + accepted (augmented) pseudo-labels.
-# ---------------------------------------------------------------------------
-
 def fine_tune(model, frames, boxes):
     x = torch.from_numpy(np.asarray(frames, dtype=np.float32))[:, None].to(DEVICE)
     y = torch.from_numpy(np.asarray(boxes, dtype=np.float32) / FRAME_HW).to(DEVICE)
     opt = torch.optim.Adam(model.parameters(), lr=1e-3)
     model.train()
-    for _ in range(FINETUNE_EPOCHS):
+    for _ in range(G_EPOCHS):
         opt.zero_grad()
         loss = nn.functional.smooth_l1_loss(model(x), y)
         loss.backward()
@@ -198,14 +248,15 @@ def save_state(s):
 def run():
     lab_frames, lab_boxes = load_labeled()
     unlabeled = load_unlabeled()
-    critic = Critic(lab_frames, lab_boxes)
 
-    model = BoxCNN().to(DEVICE)
-    fine_tune(model, lab_frames, lab_boxes)     # warm start on the labeled seed only
-    best_state = copy.deepcopy(model.state_dict())
+    G = BoxCNN().to(DEVICE)
+    D = Discriminator().to(DEVICE)
+    fine_tune(G, lab_frames, lab_boxes)
+    best_state = copy.deepcopy(G.state_dict())
 
     state = load_state()
     rng = np.random.default_rng(123)
+    hard_negs = []
 
     while True:
         stop = None
@@ -219,36 +270,45 @@ def run():
             print(f"EXIT: {stop}")
             break
 
-        # --- self-label the unlabeled pool with the current model ---
+        # --- co-evolve the adversary on real vs corrupt vs generator boundary cases ---
+        d_acc = train_discriminator(D, lab_frames, lab_boxes, hard_negs, rng)
+
+        # --- self-label the pool, judged by the learned D ---
         proposed = survived = accepted = 0
-        pf, pb = [], []
+        pf, pb, false_accepts = [], [], []
         for frame in unlabeled:
             proposed += 1
-            box, n_surv = propose_and_filter(model, frame, critic, rng)
+            box, survivors, n_surv = propose_and_filter(G, D, frame, rng)
             survived += 1 if n_surv >= 2 else 0
             if box is not None:
                 accepted += 1
                 for af, ab in augment(frame, box, rng):
                     pf.append(af); pb.append(ab)
+            elif n_surv >= 2:                                  # D let them through but they disagree
+                false_accepts += [(frame, b) for b in survivors]
+        if len(false_accepts) > FALSE_ACCEPT_PER_ROUND:        # bounded intake, no cold-start flood
+            idx = rng.choice(len(false_accepts), size=FALSE_ACCEPT_PER_ROUND, replace=False)
+            false_accepts = [false_accepts[i] for i in idx]
+        hard_negs = (hard_negs + false_accepts)[-HARD_NEG_CAP:]  # co-evolution: sharpen D on its mistakes
 
-        # --- train on labeled seed + augmented pseudo-labels ---
         train_f = list(lab_frames) + pf
         train_b = list(lab_boxes) + pb
-        loss = fine_tune(model, train_f, train_b)
-        acc = evaluate(model)                    # immutable judge — the only vote that counts
+        loss = fine_tune(G, train_f, train_b)
+        acc = evaluate(G)                                      # immutable judge
 
         kept = acc > state["best_accuracy"]
         if kept:
             state.update(best_accuracy=acc, drift_streak=0)
-            best_state = copy.deepcopy(model.state_dict())
+            best_state = copy.deepcopy(G.state_dict())
             torch.save(best_state, CKPT_PATH)
         else:
             state["drift_streak"] += 1
-            model.load_state_dict(best_state)    # revert to the last kept model
+            G.load_state_dict(best_state)
 
         print(
-            f"it={state['iteration']:02d} | proposed={proposed} veto_survived={survived} "
-            f"accepted={accepted} (train_N={len(train_f)}) | loss={loss:.4f} "
+            f"it={state['iteration']:02d} | d_acc={d_acc:.2f} hard_negs={len(hard_negs)} | "
+            f"proposed={proposed} veto_survived={survived} accepted={accepted} "
+            f"(train_N={len(train_f)}) | g_loss={loss:.4f} "
             f"anchor_acc={acc:.3f} best={state['best_accuracy']:.3f} | "
             f"{'KEEP' if kept else 'REVERT'} drift={state['drift_streak']}"
         )
