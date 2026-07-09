@@ -54,10 +54,13 @@ N_UNLABELED = 500
 N_ANCHOR = 80
 SEED = 42
 
-# Penn-Fudan three-way split (170 images total; largest person box per image)
+# Penn-Fudan three-way split (170 images total; largest person box per image).
+# Small labeled seed, large unlabeled pool: the regime where self-labeling can actually
+# add value (unlabeled >> labeled), and the direct form of the Dir4 research question —
+# how small can the trusted seed be before the loop lies to itself?
 PENN_DIR = os.path.join(HERE, "data_penn", "PennFudanPed")
 PENN_ANCHOR = 30
-PENN_LABELED = 90            # the rest become the unlabeled pool
+PENN_LABELED = 25            # the remaining ~115 become the unlabeled pool
 
 # Exit conditions (rule (c): never run forever unsupervised)
 TARGET_ACCURACY = 0.85       # stop at/above this anchor accuracy
