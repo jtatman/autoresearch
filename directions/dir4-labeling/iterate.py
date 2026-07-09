@@ -64,17 +64,21 @@ FALSE_ACCEPT_PER_ROUND = 40  # bounded co-evolution intake (avoid cold-start poi
 # ---------------------------------------------------------------------------
 
 class BoxNet(nn.Module):
-    """Lever 2: a FROZEN pretrained ResNet-18 feature extractor + a small trainable
-    regression head. Grayscale frames are repeated to 3ch and ImageNet-normalized so the
-    pretrained features apply. The backbone is never trained (tiny dataset); only the head
-    learns. BatchNorm is kept in eval mode always — we toggle ONLY the head dropout for MC
-    sampling, never model.train() (which would corrupt BN stats on single images)."""
+    """Lever 2 + unfreeze: a pretrained ResNet-18 split into a FROZEN stem (conv1..layer3)
+    and a TRAINABLE tail (layer4) + a regression head. Freezing the stem keeps the tiny
+    seed from destroying general features; unfreezing the tail lets the unlabeled
+    pseudo-labels actually reshape the representation — the only way the loop can add value
+    beyond a saturated linear head. The immutable anchor guards against the drift this
+    invites. Grayscale is repeated to 3ch + ImageNet-normalized. BatchNorm stays in eval
+    mode always; only head dropout toggles for MC sampling."""
 
     def __init__(self):
         super().__init__()
         bb = resnet18(weights=ResNet18_Weights.DEFAULT)
-        self.features = nn.Sequential(*list(bb.children())[:-1])   # -> [B, 512, 1, 1]
-        for p in self.features.parameters():
+        kids = list(bb.children())                                 # conv1,bn1,relu,maxpool,layer1..4,avgpool,fc
+        self.stem = nn.Sequential(*kids[:7])                       # conv1..layer3 (frozen)
+        self.tail = nn.Sequential(*kids[7:9])                      # layer4, avgpool (trainable)
+        for p in self.stem.parameters():
             p.requires_grad = False
         self.head = nn.Sequential(
             nn.Flatten(), nn.Linear(512, 128), nn.ReLU(), nn.Dropout(DROPOUT), nn.Linear(128, 4),
@@ -90,9 +94,10 @@ class BoxNet(nn.Module):
     def forward(self, x):
         x = x.repeat(1, 3, 1, 1)
         x = (x - self.mean) / self.std
-        with torch.no_grad():                                      # frozen backbone
-            f = self.features(x)
-        return torch.sigmoid(self.head(f))                         # head keeps grad
+        with torch.no_grad():                                      # frozen stem
+            f = self.stem(x)
+        f = self.tail(f)                                           # trainable tail keeps grad
+        return torch.sigmoid(self.head(f))
 
     def _to_box(self, n):
         b = (n * FRAME_HW)
@@ -233,7 +238,10 @@ def augment(frame, box, rng):
 def fine_tune(model, frames, boxes):
     x = torch.from_numpy(np.asarray(frames, dtype=np.float32))[:, None].to(DEVICE)
     y = torch.from_numpy(np.asarray(boxes, dtype=np.float32) / FRAME_HW).to(DEVICE)
-    opt = torch.optim.Adam(model.head.parameters(), lr=1e-3)   # backbone frozen -> head only
+    opt = torch.optim.Adam([                                   # head fast; unfrozen tail slow (temper drift)
+        {"params": model.head.parameters(), "lr": 1e-3},
+        {"params": model.tail.parameters(), "lr": 1e-4},
+    ])
     model.eval(); model.set_mc(True)                           # dropout on for training; BN stays eval
     for _ in range(G_EPOCHS):
         opt.zero_grad()
