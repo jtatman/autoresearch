@@ -28,3 +28,4 @@ directions/*/data/
 directions/*/data_*/
 directions/*/best_model.pt
 directions/*/*.pt
+directions/*/ledger.jsonl
