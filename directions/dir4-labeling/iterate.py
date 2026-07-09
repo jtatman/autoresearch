@@ -26,6 +26,7 @@ import copy
 import numpy as np
 import torch
 import torch.nn as nn
+from torchvision.models import resnet18, ResNet18_Weights
 
 from prepare import (
     load_labeled, load_unlabeled, evaluate, iou,
@@ -35,7 +36,7 @@ from prepare import (
 STATE_PATH = os.path.join(HERE, "loop_state.json")
 CKPT_PATH = os.path.join(HERE, "best_model.pt")
 
-DEVICE = "cpu"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 torch.manual_seed(0)
 np.random.seed(0)
 
@@ -62,20 +63,36 @@ FALSE_ACCEPT_PER_ROUND = 40  # bounded co-evolution intake (avoid cold-start poi
 # Generator: tiny CNN box regressor (LSTM lands when frames become video)
 # ---------------------------------------------------------------------------
 
-class BoxCNN(nn.Module):
+class BoxNet(nn.Module):
+    """Lever 2: a FROZEN pretrained ResNet-18 feature extractor + a small trainable
+    regression head. Grayscale frames are repeated to 3ch and ImageNet-normalized so the
+    pretrained features apply. The backbone is never trained (tiny dataset); only the head
+    learns. BatchNorm is kept in eval mode always — we toggle ONLY the head dropout for MC
+    sampling, never model.train() (which would corrupt BN stats on single images)."""
+
     def __init__(self):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(1, 8, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(8, 16, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
-            nn.AdaptiveMaxPool2d((8, 8)),                       # size-agnostic: 32px or 64px frames
-            nn.Flatten(), nn.Linear(16 * 8 * 8, 64), nn.ReLU(),
-            nn.Dropout(DROPOUT),                                # kept active at inference for MC sampling
-            nn.Linear(64, 4),
+        bb = resnet18(weights=ResNet18_Weights.DEFAULT)
+        self.features = nn.Sequential(*list(bb.children())[:-1])   # -> [B, 512, 1, 1]
+        for p in self.features.parameters():
+            p.requires_grad = False
+        self.head = nn.Sequential(
+            nn.Flatten(), nn.Linear(512, 128), nn.ReLU(), nn.Dropout(DROPOUT), nn.Linear(128, 4),
         )
+        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+
+    def set_mc(self, on):
+        for m in self.modules():
+            if isinstance(m, nn.Dropout):
+                m.train(on)                                        # dropout only; BN stays eval
 
     def forward(self, x):
-        return torch.sigmoid(self.net(x))
+        x = x.repeat(1, 3, 1, 1)
+        x = (x - self.mean) / self.std
+        with torch.no_grad():                                      # frozen backbone
+            f = self.features(x)
+        return torch.sigmoid(self.head(f))                         # head keeps grad
 
     def _to_box(self, n):
         b = (n * FRAME_HW)
@@ -86,21 +103,19 @@ class BoxCNN(nn.Module):
         b[2:] = np.clip(b[2:], b[:2] + 1, FRAME_HW)
         return b
 
-    def _forward_np(self, frame_2d):
+    @torch.no_grad()
+    def predict(self, frame_2d):                                   # deterministic (dropout off)
+        self.eval()
         x = torch.from_numpy(np.asarray(frame_2d, dtype=np.float32))[None, None].to(DEVICE)
-        return self(x)[0].cpu().numpy()
+        return self._to_box(self(x)[0].cpu().numpy())
 
     @torch.no_grad()
-    def predict(self, frame_2d):                                # deterministic (dropout off)
-        self.eval()
-        return self._to_box(self._forward_np(frame_2d))
-
-    @torch.no_grad()
-    def predict_mc(self, frame_2d, k):                          # stochastic (dropout on) -> uncertainty
-        self.train()
-        boxes = [self._to_box(self._forward_np(frame_2d)) for _ in range(k)]
-        self.eval()
-        return boxes
+    def predict_mc(self, frame_2d, k):                             # k dropout samples in one batch
+        self.eval(); self.set_mc(True)
+        x = torch.from_numpy(np.asarray(frame_2d, dtype=np.float32))[None, None].to(DEVICE)
+        outs = self(x.repeat(k, 1, 1, 1)).cpu().numpy()            # [k, 4], each row a different mask
+        self.set_mc(False)
+        return [self._to_box(o) for o in outs]
 
 
 # ---------------------------------------------------------------------------
@@ -218,14 +233,14 @@ def augment(frame, box, rng):
 def fine_tune(model, frames, boxes):
     x = torch.from_numpy(np.asarray(frames, dtype=np.float32))[:, None].to(DEVICE)
     y = torch.from_numpy(np.asarray(boxes, dtype=np.float32) / FRAME_HW).to(DEVICE)
-    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
-    model.train()
+    opt = torch.optim.Adam(model.head.parameters(), lr=1e-3)   # backbone frozen -> head only
+    model.eval(); model.set_mc(True)                           # dropout on for training; BN stays eval
     for _ in range(G_EPOCHS):
         opt.zero_grad()
         loss = nn.functional.smooth_l1_loss(model(x), y)
         loss.backward()
         opt.step()
-    model.eval()
+    model.set_mc(False)
     return float(loss.item())
 
 
@@ -249,7 +264,7 @@ def run():
     lab_frames, lab_boxes = load_labeled()
     unlabeled = load_unlabeled()
 
-    G = BoxCNN().to(DEVICE)
+    G = BoxNet().to(DEVICE)
     D = Discriminator().to(DEVICE)
     fine_tune(G, lab_frames, lab_boxes)
     best_state = copy.deepcopy(G.state_dict())
