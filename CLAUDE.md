@@ -167,4 +167,7 @@ Upstream nanochat originals (`train.py`, `prepare.py`, `program.md`, `README.md`
 ## GitHub
 
 `gh` CLI authenticated as `jtatman`. Remote: `https://github.com/jtatman/autoresearch`.
-`.env` is gitignored (GITHUB_TOKEN, ANTHROPIC_API_KEY if needed).
+`.env` holds secrets (GitHub tokens, ANTHROPIC_API_KEY if needed). It is gitignored **and
+untracked** as of the secrets fix. ⚠️ It was previously *committed* on the `choiceloop`
+branch (from `d74ea2a`), so the tokens still live in that branch's history — never push
+`choiceloop` without either purging `.env` from history or rotating those tokens.
